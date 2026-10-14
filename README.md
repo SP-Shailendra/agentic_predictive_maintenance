@@ -1,6 +1,6 @@
-# Compunnel FieldNote
+# Fieldnote
 
-A maintenance decision-support reference platform for monitoring equipment, retaining condition alerts, and turning operator investigations into diagnosed, policy-checked, human-approved maintenance work. Compunnel FieldNote includes an async FastAPI backend, a fixed LangGraph workflow, PostgreSQL with TimescaleDB and pgvector, and a React dashboard with Operator, Manager metrics, My work, and Knowledge views.
+A maintenance decision-support reference platform for monitoring equipment, retaining condition alerts, and turning operator investigations into diagnosed, policy-checked, human-approved maintenance work. Fieldnote includes an async FastAPI backend, a fixed LangGraph workflow, PostgreSQL with TimescaleDB and pgvector, and a React dashboard with Operator, Manager metrics, My work, and Knowledge views.
 
 > **Operating boundary:** This is a reference application, not a certified industrial control system. It does not control machinery. The included telemetry source, CMMS behavior, and local retrieval embeddings are demonstration implementations; validate and replace them before operational use.
 
@@ -26,7 +26,7 @@ The system separates device-side collection, plant-side orchestration, and enter
 
 ```mermaid
 flowchart LR
-	subgraph Users[Compunnel FieldNote users]
+	subgraph Users[Fieldnote users]
 		Operator[Operator / approver]
 		KnowledgeAdmin[Manager / reliability engineer]
 		Technician[Assigned technician]
@@ -231,7 +231,7 @@ agentic_predictive_maintenance/       # Clone directory; an existing local check
 
 **Backend ownership:** `core/` owns settings, database setup, identity, and audit helpers; `models/` owns persistence; `schemas/` owns API contracts; `agents/` owns fixed workflow orchestration; `services/` owns domain logic and integrations; `routers/` owns HTTP behavior. `services/telemetry_ingest.py` owns the shared live-condition and persistent-alert transitions used by simulator, scenario, and HTTP ingestion paths. `main.py` applies migrations, initializes demo records, and starts the enabled background workers.
 
-**Frontend ownership:** `App.jsx` composes the four role-based views, plant selection, refresh lifecycle, acknowledgement actions, and work-order navigation. Components own individual tools and panels; `services/api.js` owns HTTP requests and `services/auth.js` owns browser identity. The interface displays the product name **Compunnel FieldNote**.
+**Frontend ownership:** `App.jsx` composes the four role-based views, plant selection, refresh lifecycle, acknowledgement actions, and work-order navigation. Components own individual tools and panels; `services/api.js` owns HTTP requests and `services/auth.js` owns browser identity. This README uses the name **Fieldnote**; application branding is unchanged.
 
 **Local-only files:** `.env`, `.data/postgres/`, backup archives, private keys, virtual environments, `node_modules/`, caches, and build output are ignored by Git. Create `.env` from the placeholder-only `.env.example`; never commit real credentials. The committed PDF/DOCX samples are marked binary in `.gitattributes` to prevent line-ending conversion.
 
@@ -282,7 +282,7 @@ The drawer includes loading/error states, retry, navigable sources, focus trappi
 
 ### Knowledge document ingestion
 
-Managers and reliability engineers can ingest PDF, DOCX, TXT, and Markdown maintenance documents from the dashboard's **Knowledge** view or through `POST /api/knowledge/documents`. The UI supports metadata, role selection, status/failure review, and retry by re-upload. Text is extracted, normalized, split into overlapping word chunks, and stored with document/chunk IDs, filename, type, page or section when available, manufacturer, asset type, revision, optional source URI, plant scope, and allowed Compunnel FieldNote roles. SHA-256 checksums reject already-indexed duplicates. The document list and RAG retrieval apply the stored role/plant scope. Uploads are limited by `KNOWLEDGE_MAX_UPLOAD_MB` (10 MB by default). Retrieval exposes separate `no_matches` and `unavailable` outcomes.
+Managers and reliability engineers can ingest PDF, DOCX, TXT, and Markdown maintenance documents from the dashboard's **Knowledge** view or through `POST /api/knowledge/documents`. The UI supports metadata, role selection, status/failure review, and retry by re-upload. Text is extracted, normalized, split into overlapping word chunks, and stored with document/chunk IDs, filename, type, page or section when available, manufacturer, asset type, revision, optional source URI, plant scope, and allowed Fieldnote roles. SHA-256 checksums reject already-indexed duplicates. The document list and RAG retrieval apply the stored role/plant scope. Uploads are limited by `KNOWLEDGE_MAX_UPLOAD_MB` (10 MB by default). Retrieval exposes separate `no_matches` and `unavailable` outcomes.
 
 Eight synthetic upload fixtures are provided in `samples/knowledge_documents/`: two each of PDF, DOCX, TXT, and Markdown. Every file is labeled as a test sample, not a site-approved procedure.
 
@@ -469,7 +469,7 @@ Interactive OpenAPI docs are available at <http://localhost:8000/docs> when the 
 | `GET /api/knowledge/documents/{document_id}/chunks?plant_id={plant_id}&limit=10&offset=0` | Read a paginated preview of indexed passages for an authorized document |
 | `GET /api/knowledge/chunks/{chunk_id}?plant_id={plant_id}` | Read one cited passage with document/revision/page/section metadata after role and plant-scope checks |
 
-If `allowed_roles` is omitted, the upload is visible to all current Compunnel FieldNote read roles. Retrieval applies the document role filter and, when provided, plant filter in SQL before returning chunks to chat or diagnosis. An unscoped portfolio query can retrieve all role-authorized plant documents; a plant-scoped query can retrieve only shared or matching-plant documents. **Plant scope is a query filter, not a per-user entitlement:** OIDC currently has no configured plant-membership claim/mapping, so do not rely on it to isolate confidential plants. Re-uploading identical bytes for an indexed/processing document returns 409; a failed checksum may be re-uploaded to retry.
+If `allowed_roles` is omitted, the upload is visible to all current Fieldnote read roles. Retrieval applies the document role filter and, when provided, plant filter in SQL before returning chunks to chat or diagnosis. An unscoped portfolio query can retrieve all role-authorized plant documents; a plant-scoped query can retrieve only shared or matching-plant documents. **Plant scope is a query filter, not a per-user entitlement:** OIDC currently has no configured plant-membership claim/mapping, so do not rely on it to isolate confidential plants. Re-uploading identical bytes for an indexed/processing document returns 409; a failed checksum may be re-uploaded to retry.
 
 ### Telemetry
 
