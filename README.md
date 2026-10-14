@@ -1,8 +1,10 @@
-# Agentic Predictive Maintenance
+# Compunnel FieldNote
 
-A three-layer reference platform for turning equipment alerts into diagnosed, policy-checked, human-approved, and documented maintenance work. The repository includes an async FastAPI backend, a LangGraph workflow, PostgreSQL with TimescaleDB and pgvector, and a React operator dashboard.
+A maintenance decision-support reference platform for monitoring equipment, retaining condition alerts, and turning operator investigations into diagnosed, policy-checked, human-approved maintenance work. Compunnel FieldNote includes an async FastAPI backend, a fixed LangGraph workflow, PostgreSQL with TimescaleDB and pgvector, and a React dashboard with Operator, Manager metrics, My work, and Knowledge views.
 
 > **Operating boundary:** This is a reference application, not a certified industrial control system. It does not control machinery. The included telemetry source, CMMS behavior, and local retrieval embeddings are demonstration implementations; validate and replace them before operational use.
+
+Repository: [SP-Shailendra/agentic_predictive_maintenance](https://github.com/SP-Shailendra/agentic_predictive_maintenance).
 
 ## Contents
 
@@ -24,7 +26,7 @@ The system separates device-side collection, plant-side orchestration, and enter
 
 ```mermaid
 flowchart LR
-	subgraph Users[Fieldnote users]
+	subgraph Users[Compunnel FieldNote users]
 		Operator[Operator / approver]
 		KnowledgeAdmin[Manager / reliability engineer]
 		Technician[Assigned technician]
@@ -32,6 +34,7 @@ flowchart LR
 
 	subgraph Frontend[React dashboard]
 		Dashboard[Operator workspace]
+		ManagerUI[Manager priorities and performance]
 		KnowledgeUI[Knowledge upload and status]
 		AssistantUI[Read-only chat drawer]
 		ReviewUI[Approval and source review]
@@ -56,7 +59,7 @@ flowchart LR
 
 	subgraph Data[PostgreSQL / TimescaleDB]
 		Telemetry[(sensor_data hypertable)]
-		Operational[(plants, assets, work_orders, workflow_events)]
+		Operational[(plants, assets and persistent alerts, work_orders, workflow_events)]
 		Documents[(knowledge_documents)]
 		Chunks[(knowledge_chunks + pgvector)]
 		Notify[(Notification outbox)]
@@ -70,8 +73,10 @@ flowchart LR
 
 	Operator --> Dashboard
 	KnowledgeAdmin --> KnowledgeUI
+	KnowledgeAdmin --> ManagerUI
 	Technician --> MyWork
 	Dashboard <--> API
+	ManagerUI <--> API
 	KnowledgeUI <--> KnowledgeAPI
 	AssistantUI <--> ChatAPI
 	ReviewUI <--> WorkflowAPI
@@ -173,38 +178,62 @@ The API validates telemetry and persists it before any workflow starts. Diagnosi
 ## Repository map
 
 ```text
-agentic-predictive-maintenance/
+agentic_predictive_maintenance/       # Clone directory; an existing local checkout may use another name
 ├── .env.example
+├── .gitattributes                  # Keep PDF/DOCX fixtures binary
+├── .gitignore                      # Exclude credentials, local data, and generated files
 ├── README.md
+├── RAG_Implementation_Roadmap_Predictive_Maintenance.md
 ├── docker-compose.yml
 ├── backend/
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   ├── main.py
-│   ├── core/                 # Settings, async database engine, API-key dependency
-│   ├── models/               # Assets, telemetry, workflows, audits, outboxes, knowledge documents
-│   ├── schemas/              # Asset, chat, knowledge, simulator, and workflow API contracts
-│   ├── agents/               # Edge simulator, diagnosis, and fixed sequential LangGraph nodes
-│   ├── services/             # Ingest, document loading/chunking, RAG, chat tools, CMMS
-│   ├── routers/              # Asset, chat, knowledge, plants, simulator, telemetry, workflows
-│   └── tests/                # Unit and disposable PostgreSQL integration tests
-└── frontend/
-		├── Dockerfile
-		├── package.json
-		├── tailwind.config.js
-		├── postcss.config.js
-		├── vite.config.js
-		├── index.html
-		└── src/
-				├── App.jsx            # Dashboard composition, polling, workflow actions
-				├── main.jsx
-				├── index.css
-				├── components/        # Navigation, assistant, Knowledge, simulator, assets, charts, workflows
-				├── services/auth.js   # OIDC PKCE browser session
-				└── services/api.js    # REST client and bearer-token attachment
+│   ├── alembic.ini
+│   ├── alembic/
+│   │   ├── env.py
+│   │   ├── script.py.mako
+│   │   └── versions/               # Versioned database migrations
+│   ├── core/                       # Settings, database, migrations, OIDC roles, audit helpers
+│   ├── models/                     # Plants, assets/alerts, telemetry, workflows, outboxes, documents
+│   ├── schemas/                    # Asset, chat, knowledge, simulator, workflow contracts
+│   ├── agents/                     # Simulator, diagnosis, policy checks, fixed LangGraph
+│   ├── services/                   # Alert lifecycle, ingestion, RAG, chat, delivery/SLA workers
+│   ├── routers/                    # assets, plants, telemetry, workflow, simulator, chat, knowledge
+│   ├── scripts/evaluate_rag.py      # Disposable-database retrieval evaluation
+│   └── tests/
+│       ├── fixtures/rag_retrieval_eval.json
+│       ├── test_industrial_readiness.py
+│       ├── test_rag_ingestion.py
+│       └── test_workflow_postgres_integration.py
+├── frontend/
+│   ├── Dockerfile
+│   ├── package.json
+│   ├── tailwind.config.js
+│   ├── postcss.config.js
+│   ├── vite.config.js
+│   ├── index.html
+│   └── src/
+│       ├── App.jsx                 # Role views, scope-safe polling, alerts, workflow actions
+│       ├── main.jsx
+│       ├── index.css
+│       ├── dashboard.css           # Dashboard layout, responsive views, alert/approval styling
+│       ├── components/             # Navbar, assets, signals, reviews, Knowledge, chat, My work
+│       └── services/
+│           ├── auth.js             # OIDC Authorization Code + PKCE browser session
+│           └── api.js              # REST client, bearer tokens, multipart document upload
+├── samples/knowledge_documents/    # Eight synthetic fixtures: two PDF/DOCX/TXT/MD each
+└── scripts/
+    ├── backup.ps1
+    ├── restore.ps1
+    └── verify-backup.ps1
 ```
 
-**Backend ownership:** `core/` owns configuration and database setup; `models/` owns persistence; `schemas/` owns API contracts; `agents/` owns orchestration and agent behavior; `services/` owns external-system boundaries; `routers/` owns HTTP behavior. `routers/chat.py` exposes the read-only assistant, `routers/simulator.py` exposes simulator-gated scenarios, and `services/chat_service.py` / `services/simulator_scenarios.py` implement their domain behavior. `main.py` composes these modules and starts the application lifecycle. The frontend adds `ChatDrawer` and `SimulatorPanel` within the existing dashboard.
+**Backend ownership:** `core/` owns settings, database setup, identity, and audit helpers; `models/` owns persistence; `schemas/` owns API contracts; `agents/` owns fixed workflow orchestration; `services/` owns domain logic and integrations; `routers/` owns HTTP behavior. `services/telemetry_ingest.py` owns the shared live-condition and persistent-alert transitions used by simulator, scenario, and HTTP ingestion paths. `main.py` applies migrations, initializes demo records, and starts the enabled background workers.
+
+**Frontend ownership:** `App.jsx` composes the four role-based views, plant selection, refresh lifecycle, acknowledgement actions, and work-order navigation. Components own individual tools and panels; `services/api.js` owns HTTP requests and `services/auth.js` owns browser identity. The interface displays the product name **Compunnel FieldNote**.
+
+**Local-only files:** `.env`, `.data/postgres/`, backup archives, private keys, virtual environments, `node_modules/`, caches, and build output are ignored by Git. Create `.env` from the placeholder-only `.env.example`; never commit real credentials. The committed PDF/DOCX samples are marked binary in `.gitattributes` to prevent line-ending conversion.
 
 ## Current feature inventory
 
@@ -253,7 +282,7 @@ The drawer includes loading/error states, retry, navigable sources, focus trappi
 
 ### Knowledge document ingestion
 
-Managers and reliability engineers can ingest PDF, DOCX, TXT, and Markdown maintenance documents from the dashboard's **Knowledge** view or through `POST /api/knowledge/documents`. The UI supports metadata, role selection, status/failure review, and retry by re-upload. Text is extracted, normalized, split into overlapping word chunks, and stored with document/chunk IDs, filename, type, page or section when available, manufacturer, asset type, revision, optional source URI, plant scope, and allowed Fieldnote roles. SHA-256 checksums reject already-indexed duplicates. The document list and RAG retrieval apply the stored role/plant scope. Uploads are limited by `KNOWLEDGE_MAX_UPLOAD_MB` (10 MB by default). Retrieval exposes separate `no_matches` and `unavailable` outcomes.
+Managers and reliability engineers can ingest PDF, DOCX, TXT, and Markdown maintenance documents from the dashboard's **Knowledge** view or through `POST /api/knowledge/documents`. The UI supports metadata, role selection, status/failure review, and retry by re-upload. Text is extracted, normalized, split into overlapping word chunks, and stored with document/chunk IDs, filename, type, page or section when available, manufacturer, asset type, revision, optional source URI, plant scope, and allowed Compunnel FieldNote roles. SHA-256 checksums reject already-indexed duplicates. The document list and RAG retrieval apply the stored role/plant scope. Uploads are limited by `KNOWLEDGE_MAX_UPLOAD_MB` (10 MB by default). Retrieval exposes separate `no_matches` and `unavailable` outcomes.
 
 Eight synthetic upload fixtures are provided in `samples/knowledge_documents/`: two each of PDF, DOCX, TXT, and Markdown. Every file is labeled as a test sample, not a site-approved procedure.
 
@@ -261,13 +290,23 @@ Ingestion stores extracted chunks and metadata, not the original uploaded binary
 
 ## Using the dashboard
 
-1. Select a plant or keep **All plants**, then search/filter the Asset Health list and select an asset. Normal/Attention labels describe the current condition, not whether agents are running.
-2. Inspect **Signals** for current values, source, freshness, and trends. Choose the reading window or show all signals. Local simulator values are synthetic; `edge-simulator` is the default generated source.
-3. Optionally use **Demo tools** to start a bounded scenario. Scenario execution alone never starts an investigation. Use **Limits** to review or, with the appropriate role, change advisory thresholds with a reason.
-4. Choose **Run diagnosis** to create an investigation. Review the resulting work order under **Workflows** or through the approvals drawer. An already-open investigation prevents a duplicate start.
-5. Review the diagnosis, age, current readings, and **Trace** before approving or rejecting. Approval queues asynchronous CMMS delivery; scenario-linked work remains simulated. Authorized users can advance dispatched work through its lifecycle and technicians can record close-out feedback.
-6. Use the assistant for read-only questions about current plant/asset data. Managers can switch to **Manager metrics** to inspect recorded outcomes and sample counts.
-7. Open **History** for the selected asset's workflow, threshold, scenario, and estimated condition events. Technicians use **My work** for assigned orders; managers/reliability engineers can assign eligible orders there and manage uploaded maintenance references in **Knowledge**. Asset and work-order selections use `#asset/{id}` and `#workflow/{id}` links, which can be reloaded or shared.
+| View | Main tasks | API-authorized roles |
+| --- | --- | --- |
+| Operator | Inspect assets/Signals, acknowledge condition alerts, start investigations | Operator/reliability engineer for acknowledgement and diagnosis; approver for decisions |
+| Manager metrics | Review overdue-first approvals and non-simulated performance | Manager; approval decisions still require approver role |
+| My work / Technician assignments | Review assigned orders, assignment, lifecycle, close-out | Technician for assigned work/close-out; manager/reliability engineer for assignment |
+| Knowledge | Upload references, inspect ingestion status and indexed passages | Manager/reliability engineer for upload and dashboard view; stored role ACLs apply to retrieval |
+
+In local development without OIDC, role controls use an explicitly unverified demo identity. Production API roles remain authoritative.
+
+1. Select a plant or keep **All plants**, then search/filter Asset Health and select an asset. Normal/Attention describes the latest live condition; **Alert open** is a separate persisted state.
+2. Inspect **Signals** for current values, source, freshness, and trends. Choose the reading window or **Show all signals** for pressure and RPM. The **SYNTHETIC DATA** badge describes simulator configuration, not a separate data page. `edge-simulator` identifies generated readings; `scenario:<name>` identifies demo scenario readings.
+3. Open **Attention: Open alerts** to keep unresolved condition alerts visible even when the latest readings return to Normal. Use **Acknowledge alert** in the selected asset header. The alert clears only after acknowledgement and three consecutive newer normal readings; a new breach or gap over 60 seconds resets recovery. This does not approve or complete maintenance work.
+4. Optionally use **Demo tools** to start a bounded scenario. A scenario never starts an investigation automatically. Use **Limits** to review or, with the appropriate role, change advisory thresholds with a reason.
+5. Choose **Run diagnosis** to create an investigation. Review it under **Workflows** or through the approvals drawer. An already-open investigation prevents a duplicate start. Check diagnosis age, current readings, evidence passages, and **Trace** before an authorized approver accepts or rejects the proposal.
+6. In **Manager metrics**, review the overdue-first **Approval priorities** queue using direct **Review** actions. Performance and lifecycle counts cover all-time, non-simulated work; the approval queue includes demo orders. Refresh and six-second polling update KPIs with their own timestamp and stale/error state. Empty performance samples remain **Not measured**, not zero.
+7. In **Knowledge**, upload one of the sample files from `samples/knowledge_documents/`, set metadata and allowed roles, then expand **Preview indexed passages** after successful indexing. Inspect extracted text, page/section metadata, and additional passage pages before relying on a reference.
+8. Use **My work** for assigned orders and **History** for workflow, threshold, scenario, and estimated condition events. The assistant answers read-only questions about current data. Asset/work-order selections use reloadable `#asset/{id}` and `#workflow/{id}` links. Workflow approval queues asynchronous CMMS delivery; technicians record close-out separately.
 
 ## Workflow and persistence
 
@@ -294,6 +333,7 @@ Approval and rejection are separate API operations. OIDC bearer claims determine
 - `cmms_outbox`: durable transactional dispatch requests, stable work-order idempotency key, attempt/lease state, safe failure code, and CMMS reference.
 - `simulator_scenarios`: one active demo scenario per asset, bounded sample count, severity, optional forced fallback, actor, and recent simulated-only dispatch window.
 - `simulator_scenario_events`: start/stop/completion/rejected-sample events with actor type, subject, roles, verification flag, and scenario details.
+- `notification_outbox`: deduplicated approval/dispatch notifications, channel, retry/lease state, and delivery outcome.
 - `knowledge_documents`: uploaded document identity, SHA-256 checksum, descriptive metadata, plant scope, allowed roles, ingestion status, safe failure code, and chunk count.
 - `knowledge_chunks`: legacy seeded maintenance notes plus ingested passages, a `vector(384)` embedding, JSON metadata, and nullable `document_id`, `chunk_index`, and `page_number` provenance. Startup seeds sample notes only when the table is empty; legacy chunks remain unlinked and readable.
 
@@ -303,11 +343,15 @@ The local embedding implementation is deterministic token hashing for a runnable
 
 Only Docker Engine and the Docker Compose plugin are needed on the host. Images install their runtime dependencies inside Docker; no host Python or Node.js setup is required.
 
-1. From this directory, create the environment file:
+1. Clone the repository and create the local environment file:
 
 	 ```powershell
+	 git clone https://github.com/SP-Shailendra/agentic_predictive_maintenance.git
+	 Set-Location agentic_predictive_maintenance
 	 Copy-Item .env.example .env
 	 ```
+
+	 For an existing checkout, run these setup commands from the directory containing `docker-compose.yml`; cloning again is unnecessary. Start Docker Desktop on Windows and confirm its Linux engine is running before starting the stack.
 
 2. Edit `.env`: at minimum, replace `POSTGRES_PASSWORD` and keep the password in `DATABASE_URL` in sync. Add a Groq key to enable LLM inference; it can remain empty to use the local fallback.
 3. Build and start the stack:
@@ -325,7 +369,7 @@ Only Docker Engine and the Docker Compose plugin are needed on the host. Images 
 
 5. Open the dashboard at <http://localhost:4173>, API documentation at <http://localhost:8000/docs>, liveness at <http://localhost:8000/health>, and database readiness at <http://localhost:8000/ready>.
 
-The backend waits for the database health check, runs Alembic migrations, initializes demo knowledge rows, seeds four plants and eight demo assets, then starts the optional telemetry simulator and CMMS outbox worker. Existing databases are stamped at the legacy baseline only when the expected legacy tables are present; partially initialized schemas stop startup for manual review. The backend runs as non-root and is healthy only when its database readiness query succeeds. Compose ports bind to loopback by default; PostgreSQL stays on the Compose network. The database image is `timescale/timescaledb:latest-pg16`.
+The backend waits for the database health check, runs Alembic migrations, initializes demo knowledge rows, seeds four plants and eight demo assets, then starts the optional telemetry simulator plus CMMS outbox, approval SLA, and notification workers. The current migration head is `20261014_0010`, which adds persisted condition-alert state and acknowledgement/recovery fields. Existing databases are stamped at the legacy baseline only when the expected legacy tables are present; partially initialized schemas stop startup for manual review. The backend runs as non-root and is healthy only when its database readiness query succeeds. Compose ports bind to loopback by default; PostgreSQL stays on the Compose network. The database image is `timescale/timescaledb:latest-pg16`.
 
 Stop containers while retaining database data:
 
@@ -425,7 +469,7 @@ Interactive OpenAPI docs are available at <http://localhost:8000/docs> when the 
 | `GET /api/knowledge/documents/{document_id}/chunks?plant_id={plant_id}&limit=10&offset=0` | Read a paginated preview of indexed passages for an authorized document |
 | `GET /api/knowledge/chunks/{chunk_id}?plant_id={plant_id}` | Read one cited passage with document/revision/page/section metadata after role and plant-scope checks |
 
-If `allowed_roles` is omitted, the upload is visible to all current Fieldnote read roles. Retrieval applies the document role filter and, when provided, plant filter in SQL before returning chunks to chat or diagnosis. An unscoped portfolio query can retrieve all role-authorized plant documents; a plant-scoped query can retrieve only shared or matching-plant documents. **Plant scope is a query filter, not a per-user entitlement:** OIDC currently has no configured plant-membership claim/mapping, so do not rely on it to isolate confidential plants. Re-uploading identical bytes for an indexed/processing document returns 409; a failed checksum may be re-uploaded to retry.
+If `allowed_roles` is omitted, the upload is visible to all current Compunnel FieldNote read roles. Retrieval applies the document role filter and, when provided, plant filter in SQL before returning chunks to chat or diagnosis. An unscoped portfolio query can retrieve all role-authorized plant documents; a plant-scoped query can retrieve only shared or matching-plant documents. **Plant scope is a query filter, not a per-user entitlement:** OIDC currently has no configured plant-membership claim/mapping, so do not rely on it to isolate confidential plants. Re-uploading identical bytes for an indexed/processing document returns 409; a failed checksum may be re-uploaded to retry.
 
 ### Telemetry
 
@@ -520,25 +564,29 @@ Manager metrics are computed from persisted close-outs and dispatch timestamps:
 - Top-3 cause accuracy: confirmed root cause appears in the stored diagnosis failure-mode list (target 80%+). No prediction sample is included if the stored diagnosis has no cause list.
 - Approval-to-dispatch p95: elapsed seconds from approver action to CMMS acceptance (target under five minutes).
 
-Scenario-marked orders and historical `SIM-` references are excluded from the usefulness, root-cause, and real-dispatch samples. Responses include `usefulness_sample_count`, `root_cause_sample_count`, `dispatch_sample_count`, and `simulated_dispatch_count`; the dashboard marks fewer than five samples as preliminary. Empty denominators return `null`/"Not measured" rather than a misleading zero. These pilot measures are not yet validated on historical labeled site data.
+Scenario-marked orders and historical `SIM-` references are excluded from the usefulness, root-cause, real-dispatch samples, and lifecycle counts. Responses include `usefulness_sample_count`, `root_cause_sample_count`, `dispatch_sample_count`, and `simulated_dispatch_count`; measured results with one to four samples are preliminary. Empty denominators return `null`/"Not measured" with neutral missing-data context rather than a misleading zero. The dashboard uses the API's targets and a separate KPI update timestamp. Reporting-period selectors and trend charts are not implemented; aggregates are all-time within the selected plant scope. These pilot measures are not yet validated on historical labeled site data.
 
 `PATCH /api/assets/{asset_id}/thresholds` requires vibration/temperature values (either can be `null` to use the demo default) and a reason. Each change records previous/new limits and the verified actor subject. `GET /api/assets/{asset_id}/threshold-history` returns recent changes. Thresholds are advisory and are not engineering-approved operating envelopes unless separately commissioned by the site.
 
 ## Operations and troubleshooting
 
-- **Database never becomes healthy:** inspect `docker compose logs db`; confirm the Docker host has resources and that port `5432` is available.
+- **Docker daemon unavailable:** on Windows, start Docker Desktop and confirm the Linux engine is running. A missing `dockerDesktopLinuxEngine` pipe means Docker is unavailable; it is not a frontend or API-code failure. Run `docker compose up -d` once the engine is ready.
+- **Database never becomes healthy:** inspect `docker compose logs db` and confirm the Docker host has resources and access to `.data/postgres`. The default Compose configuration does not publish PostgreSQL port `5432` to the host.
 - **Backend cannot connect to PostgreSQL:** inside Compose, `DATABASE_URL` must use host `db`, not `localhost`. Ensure the database user, password, and name match the Compose settings.
 - **Extension or hypertable startup error:** use the documented TimescaleDB image and check the database logs. Startup needs permission to create the `vector` and `timescaledb` extensions.
 - **Browser reports API offline or CORS errors:** confirm the backend is healthy on port `8000`, `VITE_API_URL` points to a URL reachable from the browser, and that origin is listed in `CORS_ORIGINS`. Vite API URL is baked into the frontend at image build time, so rebuild after changing it.
+- **API returns 429:** the API has a per-process, per-client request limit (`RATE_LIMIT_REQUESTS_PER_MINUTE`, default 120). Several dashboard tabs can exhaust it because each polls multiple endpoints. Close extra tabs and retry after the limit window, or configure an appropriate development limit. Chat has an additional separate limit.
 - **Diagnosis uses a fallback:** confirm `GROQ_API_KEY` is present in `.env`, then recreate the backend container with `docker compose up --build -d backend`. Groq availability is not required for app startup.
 - **Demo values look artificial:** the simulator intentionally generates synthetic signals every few seconds. Disable it with `SIMULATOR_ENABLED=false` when using an external ingestion adapter.
 - **SYNTHETIC DATA is enabled but its readings are unclear:** this badge describes simulator configuration, not a separate dataset or a guarantee of fresh samples. Select an asset and inspect its vibration/temperature values and the Signals source readout. `edge-simulator` identifies default generated readings, while `scenario:<name>` identifies scenario samples. If values are absent or stale, check backend logs and `/health`, confirm the simulator is enabled, and check whether a dropout scenario is active. Real plant readings require an external ingestion adapter.
 - **UI still shows an older label or layout:** rebuild/redeploy with `docker compose up --build -d frontend`, then reload the browser. Frontend source and Vite settings are bundled into the image, not applied live to an already-loaded page.
+- **Normal asset still needs attention:** this is intentional when its condition alert is open. Check acknowledgement and recovery progress in the selected header. Normal readings alone do not clear an unacknowledged alert, and acknowledgement alone does not confirm recovery.
+- **Manager metrics show Not measured:** the relevant real close-out/dispatch denominator is empty. Simulated orders are excluded from performance; do not interpret demo dispatches as validated results. An overdue approval remains actionable in the priority queue even when performance metrics have no samples.
 - **Investigation start returns 409:** an investigation is already processing or awaiting approval for this asset. Open the existing work order instead of starting another.
 - **Need to inspect container output:** use `docker compose logs -f backend`, `docker compose logs -f frontend`, or `docker compose logs -f db`.
 - **Metrics:** scrape `http://localhost:8000/metrics` with `X-Metrics-API-Key` when configured. Production startup requires this key; restrict the endpoint at the network boundary as well.
 - **Backups:** use `scripts/backup.ps1`, `scripts/restore.ps1`, and `scripts/verify-backup.ps1`. Restore requires an empty target database and uses TimescaleDB's pre/post-restore functions. Schedule these through your deployment platform and store the archive in off-host encrypted storage.
-- **Tests:** from `backend/`, run `python -m unittest discover -s tests -p test_industrial_readiness.py -v` and `python -m unittest discover -s tests -p test_rag_ingestion.py -v`. PostgreSQL integration tests require `TEST_DATABASE_URL` to point to a disposable TimescaleDB/PostgreSQL database; they cover approval races/self-approval, outbox retries, close-out metrics, thresholds, telemetry deduplication, simulator gating/source/audit/CMMS bypass, knowledge ingestion/ACL/retry, citation persistence/source access, and the RAG Recall@K/MRR fixture. Never point it at the live database.
+- **Tests:** from `backend/`, run `python -m unittest discover -s tests -p test_industrial_readiness.py -v` and `python -m unittest discover -s tests -p test_rag_ingestion.py -v`. PostgreSQL integration tests require `TEST_DATABASE_URL` to point to a disposable TimescaleDB/PostgreSQL database; they cover persistent-alert acknowledgement/recovery and role checks, approval races/self-approval, outbox retries, close-out metrics, thresholds, telemetry deduplication/chronological batches, simulator gating/source/audit/CMMS bypass, knowledge ingestion/ACL/retry, citation persistence/source access, and the RAG Recall@K/MRR fixture. Never point it at the live database.
 
 ## Security and production readiness
 
@@ -546,6 +594,7 @@ Before using this design in a real plant or enterprise environment:
 
 - Configure the browser OIDC authority, public client ID, redirect URI, and provider role-claim mapping alongside the API issuer, audience, JWKS endpoint, and API role claim. The browser uses Authorization Code + PKCE and does not contain a client secret; test login, logout, token expiry, and provider claim mappings with the actual identity provider before production use.
 - Do not expose shared secrets to the frontend. Protect and rotate Groq, database, metrics, and CMMS credentials; mount secret files from a deployment secret manager at `/run/secrets`.
+- Keep real `.env` variants, private keys, local databases, and backup archives out of Git. `.env.example` contains placeholders only. Ignoring a path does not remove credentials already committed; rotate exposed values and handle repository-history cleanup separately if a leak occurs.
 - Use least-privilege database/service accounts, off-host encrypted backups, tested restores, telemetry retention, and resource limits. Alembic migrations are now the schema authority; complete legacy schemas are stamped at the baseline, while partial schemas stop startup for manual handling.
 - Add centralized structured logs, distributed traces, alerting, and gateway rate limits. The in-process IP limiter and Prometheus counters/histograms are single-instance foundations, not distributed abuse protection or full observability.
 - Define role assignment, approval policy, separation of duties, site-specific safety procedures, and an external archive/verification process for audit hashes before enabling dispatch.
@@ -563,5 +612,5 @@ Before using this design in a real plant or enterprise environment:
 - Knowledge retrieval enforces document role ACLs and optional plant query scope, but plant scope is not authorization until identity-to-plant entitlements are configured. Role ACLs are a single allowed-role list, not group, user, or document-owner policies.
 - Groq diagnosis is optional and advisory. The no-key path uses simple vibration/temperature thresholds, not a trained predictive-maintenance model.
 - Simulator and thresholds are for demonstration. There are no certification claims, functional safety claims, or direct machinery control paths.
-- Acknowledgement and snooze controls for suggested investigations, email/Teams delivery deduplication beyond the destination's idempotency support, weekly pilot trend reporting, and a labeled-data evaluation harness are not implemented. SLA notifications are approval-focused; they do not provide technician scheduling or escalation policies.
-- Off-host audit hash verification, OPC UA/MQTT clients, historian connectors, a trained healthy-baseline detector, automatic alerting, semantic embeddings, claim-level citation entailment, drift monitoring, OpenTelemetry traces, PDF audit packs, and vendor CMMS adapters/status sync are not included. Browser OIDC is implemented but still requires provider-specific configuration and deployment validation. Metrics, role enforcement, migrations, and hash-linked events are foundations, not certification or full production observability.
+- Persistent threshold condition alerts and operator acknowledgement are implemented. Alert snooze, automatic investigation creation, email/Teams delivery deduplication beyond the destination's idempotency support, reporting-period filters, weekly pilot trend reporting, and a labeled-data evaluation harness are not implemented. SLA notifications are approval-focused; they do not provide technician scheduling or escalation policies.
+- Off-host audit hash verification, OPC UA/MQTT clients, historian connectors, a trained healthy-baseline detector, autonomous diagnosis/dispatch, semantic embeddings, claim-level citation entailment, drift monitoring, OpenTelemetry traces, PDF audit packs, and vendor CMMS adapters/status sync are not included. Browser OIDC is implemented but still requires provider-specific configuration and deployment validation. Metrics, role enforcement, migrations, and hash-linked events are foundations, not certification or full production observability.
