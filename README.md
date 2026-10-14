@@ -160,7 +160,7 @@ sequenceDiagram
 			C-->>W: Acceptance or retryable failure
 			W->>DB: Persist delivery result and audit event
 		else Rejected
-			API->>DB: Persist rejection; do not dispatch
+			API->>DB: Persist rejection, do not dispatch
 		end
 	end
 	API-->>UI: Answer, evidence state, and permitted source references
