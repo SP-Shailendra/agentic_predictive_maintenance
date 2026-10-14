@@ -1,0 +1,22 @@
+[
+  {
+    "id": "pump-vibration",
+    "query": "What should be checked when a pump has elevated vibration?",
+    "relevant_phrases": ["Elevated pump vibration:"]
+  },
+  {
+    "id": "motor-temperature",
+    "query": "How should high motor temperature be investigated?",
+    "relevant_phrases": ["High motor temperature:"]
+  },
+  {
+    "id": "critical-alert-safety",
+    "query": "What precautions apply to a critical equipment alert?",
+    "relevant_phrases": ["Critical equipment alert:"]
+  },
+  {
+    "id": "pressure-deviation",
+    "query": "What should I verify for a pressure deviation?",
+    "relevant_phrases": ["Pressure deviations:"]
+  }
+]

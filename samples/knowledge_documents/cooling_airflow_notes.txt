@@ -1,0 +1,13 @@
+SAMPLE DOCUMENT - NOT A SITE-APPROVED PROCEDURE
+
+Title: Motor cooling and airflow review
+Document type: Maintenance note
+Manufacturer: Example Motor Works
+Asset type: Electric motor
+Revision: Sample-02
+
+For a high temperature indication, first verify the sensor, timestamp, units, and current approved limit. Compare the reading with recent telemetry and the motor operating context where available.
+
+Potential records to consult include cooling-path inspection history, filter or fan maintenance logs, load information, and calibrated temperature checks performed under the site's approved procedure. Friction, overload, airflow restriction, or sensor error are possibilities, not confirmed diagnoses.
+
+This synthetic note does not specify an operating limit or authorize intervention. Follow the current site safety and maintenance procedures.

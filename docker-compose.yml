@@ -1,0 +1,57 @@
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-maintenance}
+      POSTGRES_USER: ${POSTGRES_USER:-maintenance}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    volumes:
+      - type: bind
+        source: ./.data/postgres
+        target: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-maintenance} -d ${POSTGRES_DB:-maintenance}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://maintenance:change-me@db:5432/maintenance}
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 45s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: http://localhost:8000/api
+        VITE_OIDC_AUTHORITY: ${VITE_OIDC_AUTHORITY:-}
+        VITE_OIDC_CLIENT_ID: ${VITE_OIDC_CLIENT_ID:-}
+        VITE_OIDC_REDIRECT_URI: ${VITE_OIDC_REDIRECT_URI:-http://localhost:4173/}
+        VITE_OIDC_ROLES_CLAIM: ${VITE_OIDC_ROLES_CLAIM:-roles}
+    ports:
+      - "127.0.0.1:4173:4173"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+

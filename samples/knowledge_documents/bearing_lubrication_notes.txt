@@ -1,0 +1,13 @@
+SAMPLE DOCUMENT - NOT A SITE-APPROVED PROCEDURE
+
+Title: Bearing lubrication review notes
+Document type: Maintenance note
+Manufacturer: Example Rotating Equipment
+Asset type: Motor and pump bearings
+Revision: Sample-01
+
+Use these notes only to test document search. An elevated vibration or temperature reading is not proof of bearing damage.
+
+Review the asset-specific lubrication schedule, lubricant specification, service history, and inspection records. Check that records correspond to the correct asset and date. If lubrication condition needs inspection, use the site-approved procedure and qualified personnel.
+
+Do not add lubricant, open guards, or disturb operating equipment based only on this sample. Verify isolation requirements and obtain the required authorization before maintenance.
