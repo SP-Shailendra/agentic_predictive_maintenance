@@ -25,6 +25,8 @@ class AssetRead(BaseModel):
     alert_started_at: datetime | None = None
     alert_acknowledged_at: datetime | None = None
     alert_acknowledged_by: str | None = None
+    alert_snoozed_until: datetime | None = None
+    alert_snoozed_by: str | None = None
     alert_normal_readings: int = 0
     alert_last_reading_at: datetime | None = None
     criticality: str
@@ -55,6 +57,20 @@ class AssetAlertAcknowledgementRead(BaseModel):
     recovery_readings_required: int
     recovery_max_gap_seconds: int
     status: Literal["acknowledged", "cleared"]
+
+
+class AssetAlertSnoozeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    minutes: int = Field(ge=5, le=1440)
+    reason: str = Field(min_length=5, max_length=500)
+
+
+class AssetAlertSnoozeRead(BaseModel):
+    asset_id: uuid.UUID
+    alert_snoozed_until: datetime
+    alert_snoozed_by: str | None
+    reason: str
 
 
 class PlantRead(BaseModel):

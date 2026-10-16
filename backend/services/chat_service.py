@@ -14,6 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
+from core.security import plant_scope_filter
 from core.security import Principal
 from models import Asset, Plant, SensorData, WorkOrder, WorkflowEvent
 from schemas.chat import ChatRequest
@@ -92,15 +93,17 @@ def build_read_tools(db: AsyncSession, request: ChatRequest, principal: Principa
     knowledge_status = {"status": "not_searched"}
     plant_scope = request.plant_id
 
+    def apply_plant_scope(query, column, requested_plant_id=None):
+        scope = plant_scope_filter(principal, column, requested_plant_id)
+        return query.where(scope) if scope is not None else query
+
     def cite(kind: str, identifier: object, label: str, timestamp: datetime | None = None) -> None:
         source = {"type": kind, "id": str(identifier), "label": label, "timestamp": timestamp.isoformat() if timestamp else None}
         if source not in sources:
             sources.append(source)
 
     async def list_plants() -> str:
-        query = select(Plant)
-        if plant_scope:
-            query = query.where(Plant.id == plant_scope)
+        query = apply_plant_scope(select(Plant), Plant.id, plant_scope)
         plants = (await db.scalars(query.order_by(Plant.code).limit(50))).all()
         values = []
         for plant in plants:
@@ -117,8 +120,7 @@ def build_read_tools(db: AsyncSession, request: ChatRequest, principal: Principa
             .outerjoin(latest, latest.c.asset_id == Asset.id)
             .outerjoin(SensorData, (SensorData.asset_id == latest.c.asset_id) & (SensorData.timestamp == latest.c.timestamp))
         )
-        if effective_plant:
-            query = query.where(Asset.plant_id == effective_plant)
+        query = apply_plant_scope(query, Asset.plant_id, effective_plant)
         rows = (await db.execute(query.order_by(Asset.asset_tag).limit(100))).all()
         values = []
         for asset, reading in rows:
@@ -140,9 +142,7 @@ def build_read_tools(db: AsyncSession, request: ChatRequest, principal: Principa
             parsed_id = UUID(asset_id)
         except ValueError:
             return _json_result({"error": "Asset ID must be a valid UUID."})
-        query = select(Asset).where(Asset.id == parsed_id)
-        if plant_scope:
-            query = query.where(Asset.plant_id == plant_scope)
+        query = apply_plant_scope(select(Asset).where(Asset.id == parsed_id), Asset.plant_id, plant_scope)
         asset = await db.scalar(query)
         if asset is None:
             return _json_result({"error": "I don't have that asset."})
@@ -169,9 +169,7 @@ def build_read_tools(db: AsyncSession, request: ChatRequest, principal: Principa
             parsed_id = UUID(asset_id)
         except ValueError:
             return _json_result({"error": "Asset ID must be a valid UUID."})
-        asset_query = select(Asset).where(Asset.id == parsed_id)
-        if plant_scope:
-            asset_query = asset_query.where(Asset.plant_id == plant_scope)
+        asset_query = apply_plant_scope(select(Asset).where(Asset.id == parsed_id), Asset.plant_id, plant_scope)
         asset = await db.scalar(asset_query)
         if asset is None:
             return _json_result({"error": "I don't have that asset's telemetry."})
@@ -210,8 +208,7 @@ def build_read_tools(db: AsyncSession, request: ChatRequest, principal: Principa
     async def list_workflows(plant_id: str | None = None, status: str | None = None) -> str:
         effective_plant = UUID(plant_id) if plant_id else plant_scope
         query = select(WorkOrder, Asset).join(Asset, Asset.id == WorkOrder.asset_id)
-        if effective_plant:
-            query = query.where(Asset.plant_id == effective_plant)
+        query = apply_plant_scope(query, Asset.plant_id, effective_plant)
         if status:
             query = query.where(WorkOrder.status == status)
         rows = (await db.execute(query.order_by(WorkOrder.created_at.desc()).limit(50))).all()
@@ -227,8 +224,7 @@ def build_read_tools(db: AsyncSession, request: ChatRequest, principal: Principa
         except ValueError:
             return _json_result({"error": "Work-order ID must be a valid UUID."})
         query = select(WorkOrder).join(Asset, Asset.id == WorkOrder.asset_id).where(WorkOrder.id == parsed_id)
-        if plant_scope:
-            query = query.where(Asset.plant_id == plant_scope)
+        query = apply_plant_scope(query, Asset.plant_id, plant_scope)
         order = await db.scalar(query)
         if order is None:
             return _json_result({"error": "I don't have that work order."})
@@ -244,8 +240,7 @@ def build_read_tools(db: AsyncSession, request: ChatRequest, principal: Principa
         except ValueError:
             return _json_result({"error": "Work-order ID must be a valid UUID."})
         query = select(WorkOrder, Asset).join(Asset, Asset.id == WorkOrder.asset_id).where(WorkOrder.id == parsed_id)
-        if plant_scope:
-            query = query.where(Asset.plant_id == plant_scope)
+        query = apply_plant_scope(query, Asset.plant_id, plant_scope)
         row = (await db.execute(query)).first()
         if row is None:
             return _json_result({"error": "I don't have that work order."})
@@ -266,7 +261,10 @@ def build_read_tools(db: AsyncSession, request: ChatRequest, principal: Principa
                 query[:500],
                 limit=3,
                 allowed_roles=principal.roles,
+                allowed_subject=principal.subject if principal.verified else None,
+                allowed_groups=principal.groups,
                 plant_id=request.plant_id,
+                allowed_plant_ids=principal.plant_ids,
             )
         except Exception as error:
             knowledge_status["status"] = "unavailable"
@@ -300,9 +298,7 @@ def build_read_tools(db: AsyncSession, request: ChatRequest, principal: Principa
             parsed_id = UUID(asset_id)
         except ValueError:
             return _json_result({"error": "Asset ID must be a valid UUID."})
-        asset_query = select(Asset).where(Asset.id == parsed_id)
-        if plant_scope:
-            asset_query = asset_query.where(Asset.plant_id == plant_scope)
+        asset_query = apply_plant_scope(select(Asset).where(Asset.id == parsed_id), Asset.plant_id, plant_scope)
         asset = await db.scalar(asset_query)
         if asset is None:
             return _json_result({"error": "I don't have that asset."})
@@ -370,7 +366,7 @@ def _find_asset_tag(message: str, assets: list[Asset]) -> Asset | None:
     return next((asset for asset in assets if asset.asset_tag.casefold() in lowered), None)
 
 
-async def _rule_based_answer(request: ChatRequest, db: AsyncSession, functions, sources) -> str:
+async def _rule_based_answer(request: ChatRequest, db: AsyncSession, functions, sources, principal: Principal) -> str:
     text = request.message.casefold()
     write_request = any(phrase in text for phrase in (
         "approve it", "approve this", "approve the work", "reject it", "reject this", "dispatch it",
@@ -382,8 +378,19 @@ async def _rule_based_answer(request: ChatRequest, db: AsyncSession, functions, 
     if any(term in text for term in ("remaining useful life", "rul", "spectrum", "spectra", "fault probability", "failure probability")):
         return "I don't have that data. Fieldnote does not calculate remaining useful life, spectra, or calibrated fault probabilities."
 
-    assets = list((await db.scalars(select(Asset).where(Asset.plant_id == request.plant_id) if request.plant_id else select(Asset))).all())
-    asset = await db.get(Asset, request.asset_id) if request.asset_id else _find_asset_tag(request.message, assets)
+    asset_query = select(Asset)
+    plant_filter = plant_scope_filter(principal, Asset.plant_id, request.plant_id)
+    if plant_filter is not None:
+        asset_query = asset_query.where(plant_filter)
+    assets = list((await db.scalars(asset_query)).all())
+    asset = None
+    if request.asset_id:
+        asset_query = select(Asset).where(Asset.id == request.asset_id)
+        if plant_filter is not None:
+            asset_query = asset_query.where(plant_filter)
+        asset = await db.scalar(asset_query)
+    else:
+        asset = _find_asset_tag(request.message, assets)
 
     if "approval" in text or "awaiting" in text or "need approval" in text:
         payload = json.loads(await functions["list_workflows"](plant_id=str(request.plant_id) if request.plant_id else None, status="awaiting_approval"))
@@ -449,6 +456,7 @@ async def _rule_based_answer(request: ChatRequest, db: AsyncSession, functions, 
 async def answer_chat(request: ChatRequest, db: AsyncSession, principal: Principal) -> dict[str, Any]:
     started = datetime.now(timezone.utc)
     started_clock = asyncio.get_running_loop().time()
+    plant_scope_filter(principal, Plant.id, request.plant_id)
     tools, read_functions, sources, knowledge_status = build_read_tools(db, request, principal)
     used_llm = False
     truncated = False
@@ -464,7 +472,7 @@ async def answer_chat(request: ChatRequest, db: AsyncSession, principal: Princip
     functions = {name: tracked_tool(name, function) for name, function in read_functions.items()}
 
     if not settings.groq_api_key:
-        answer = await _rule_based_answer(request, db, functions, sources)
+        answer = await _rule_based_answer(request, db, functions, sources, principal)
     else:
         system = SystemMessage(content=(
             "You answer Fieldnote operator questions using only results from the supplied read-only tools. "
@@ -489,7 +497,7 @@ async def answer_chat(request: ChatRequest, db: AsyncSession, principal: Princip
                 if not tool_calls:
                     answer = str(response.content)
                     if calls == 0:
-                        answer = await _rule_based_answer(request, db, functions, sources)
+                        answer = await _rule_based_answer(request, db, functions, sources, principal)
                         used_llm = False
                     else:
                         answer = str(response.content)
@@ -519,7 +527,7 @@ async def answer_chat(request: ChatRequest, db: AsyncSession, principal: Princip
                 used_llm = True
         except Exception as error:
             logger.warning("Fieldnote chat LLM failed (%s); using rule-based response", type(error).__name__)
-            answer = await _rule_based_answer(request, db, functions, sources)
+            answer = await _rule_based_answer(request, db, functions, sources, principal)
             used_llm = False
 
     if any("scenario:" in source.get("label", "") for source in sources):

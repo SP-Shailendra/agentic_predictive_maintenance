@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from core.database import get_db
-from core.security import Principal, require_api_key, require_roles, WORKFLOW_READ_ROLES
+from core.security import Principal, plant_scope_filter, require_api_key, require_roles, WORKFLOW_READ_ROLES
 from models import Asset, SimulatorScenario
 from schemas.simulator import ScenarioRead, ScenarioStart
 from services.simulator_scenarios import (
@@ -32,11 +32,15 @@ async def list_scenarios(
     _principal: Principal = Depends(require_roles(*WORKFLOW_READ_ROLES)),
 ) -> list[SimulatorScenario]:
     _require_simulator()
-    rows = await db.scalars(
-        select(SimulatorScenario)
+    query = (
+        select(SimulatorScenario).join(Asset, Asset.id == SimulatorScenario.asset_id)
         .where(SimulatorScenario.active.is_(True))
         .order_by(SimulatorScenario.started_at.desc())
     )
+    plant_filter = plant_scope_filter(_principal, Asset.plant_id)
+    if plant_filter is not None:
+        query = query.where(plant_filter)
+    rows = await db.scalars(query)
     return list(rows.all())
 
 
@@ -47,7 +51,11 @@ async def start_scenario(
     principal: Principal = Depends(require_roles("operator", "reliability_engineer")),
 ) -> dict[str, object]:
     _require_simulator()
-    asset = await db.scalar(select(Asset).where(Asset.id == payload.asset_id).with_for_update())
+    asset_query = select(Asset).where(Asset.id == payload.asset_id)
+    plant_filter = plant_scope_filter(principal, Asset.plant_id)
+    if plant_filter is not None:
+        asset_query = asset_query.where(plant_filter)
+    asset = await db.scalar(asset_query.with_for_update())
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found")
 
@@ -130,7 +138,11 @@ async def stop_scenario(
     principal: Principal = Depends(require_roles("operator", "reliability_engineer")),
 ) -> dict[str, object]:
     _require_simulator()
-    asset = await db.scalar(select(Asset).where(Asset.id == asset_id).with_for_update())
+    asset_query = select(Asset).where(Asset.id == asset_id)
+    plant_filter = plant_scope_filter(principal, Asset.plant_id)
+    if plant_filter is not None:
+        asset_query = asset_query.where(plant_filter)
+    asset = await db.scalar(asset_query.with_for_update())
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found")
     scenario = await db.get(SimulatorScenario, asset.id)

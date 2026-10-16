@@ -10,6 +10,8 @@ class WorkflowState(TypedDict, total=False):
     location: str
     plant_id: str
     knowledge_roles: list[str]
+    knowledge_subject: str
+    knowledge_groups: list[str]
     alert_type: str
     severity: str
     message: str
@@ -29,6 +31,8 @@ class WorkflowState(TypedDict, total=False):
     evidence_sources: list[dict[str, Any]]
     evidence_status: str
     evidence_error_code: str
+    citation_verification_status: str
+    citation_checks: list[dict[str, Any]]
     compliance_check: dict[str, Any]
     requires_approval: bool
     approved: bool

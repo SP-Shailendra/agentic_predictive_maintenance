@@ -24,6 +24,8 @@ class Asset(Base):
     alert_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     alert_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     alert_acknowledged_by: Mapped[str | None] = mapped_column(String(255))
+    alert_snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    alert_snoozed_by: Mapped[str | None] = mapped_column(String(255))
     alert_normal_readings: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     alert_last_reading_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     criticality: Mapped[str] = mapped_column(String(24), nullable=False, default="medium")

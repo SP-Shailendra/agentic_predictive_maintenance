@@ -10,6 +10,7 @@ from core.config import settings
 from agents.state import WorkflowState
 from schemas.failure_modes import FailureMode
 from services.rag_service import build_citation_refs, retrieve_documents
+from services.citation_verification import verify_claims_with_sources
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,8 @@ class DiagnosisResult(BaseModel):
     evidence_sources: list[dict[str, object]] = Field(default_factory=list)
     evidence_status: str = "unavailable"
     evidence_error_code: str | None = None
+    citation_verification_status: str = "unavailable"
+    citation_checks: list[dict[str, object]] = Field(default_factory=list)
     method: str = "threshold_fallback"
     model_version: str = "threshold-fallback-v1"
 
@@ -66,6 +69,8 @@ async def diagnose_alert(state: WorkflowState) -> DiagnosisResult:
             build_retrieval_query(state),
             limit=3,
             allowed_roles=state.get("knowledge_roles"),
+            allowed_subject=state.get("knowledge_subject"),
+            allowed_groups=state.get("knowledge_groups"),
             plant_id=uuid.UUID(state["plant_id"]) if state.get("plant_id") else None,
         )
         evidence = [str(chunk["content"]) for chunk in retrieved_chunks]
@@ -81,6 +86,8 @@ async def diagnose_alert(state: WorkflowState) -> DiagnosisResult:
             "evidence_sources": evidence_sources,
             "evidence_status": evidence_status,
             "evidence_error_code": evidence_error_code,
+            "citation_verification_status": "unavailable",
+            "citation_checks": [],
         })
 
     if not settings.groq_api_key or state.get("force_llm_fallback"):
@@ -131,11 +138,17 @@ async def diagnose_alert(state: WorkflowState) -> DiagnosisResult:
         if start < 0 or end < start:
             raise ValueError("Model response did not contain a JSON object")
         result = DiagnosisResult.model_validate_json(content[start:end + 1])
+        citation_status, citation_checks = await verify_claims_with_sources(
+            [result.diagnosis, result.recommendation],
+            retrieved_chunks,
+        )
         return result.model_copy(update={
             "evidence": evidence,
             "evidence_sources": evidence_sources,
             "evidence_status": evidence_status,
             "evidence_error_code": evidence_error_code,
+            "citation_verification_status": citation_status,
+            "citation_checks": citation_checks,
             "method": "llm",
             "model_version": settings.groq_model,
         })

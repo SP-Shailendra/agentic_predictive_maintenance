@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
@@ -8,9 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.audit import append_workflow_event
 from core.config import settings
 from core.database import get_db
-from core.security import Principal, require_api_key, require_roles, WORKFLOW_READ_ROLES
-from models import Asset, AssetThresholdChange, Plant, SensorData, SimulatorScenarioEvent, WorkOrder, WorkflowEvent
-from schemas.asset import AssetAlertAcknowledgementRead, AssetHistoryEventRead, AssetRead, AssetThresholdChangeRead, AssetThresholdUpdate
+from core.security import Principal, plant_scope_filter, require_api_key, require_roles, WORKFLOW_READ_ROLES
+from models import Asset, AssetAlertSnooze, AssetThresholdChange, Plant, SensorData, SimulatorScenarioEvent, WorkOrder, WorkflowEvent
+from schemas.asset import AssetAlertAcknowledgementRead, AssetAlertSnoozeRead, AssetAlertSnoozeRequest, AssetHistoryEventRead, AssetRead, AssetThresholdChangeRead, AssetThresholdUpdate
 from services.telemetry_ingest import ALERT_RECOVERY_MAX_GAP_SECONDS, ALERT_RECOVERY_READINGS, acknowledge_asset_alert
 
 router = APIRouter(prefix="/assets", tags=["assets"], dependencies=[Depends(require_api_key)])
@@ -20,7 +20,7 @@ router = APIRouter(prefix="/assets", tags=["assets"], dependencies=[Depends(requ
 async def list_assets(
     plant_id: uuid.UUID | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
-    _principal: Principal = Depends(require_roles(*WORKFLOW_READ_ROLES)),
+    principal: Principal = Depends(require_roles(*WORKFLOW_READ_ROLES)),
 ) -> list[AssetRead]:
     latest = (
         select(SensorData.asset_id.label("asset_id"), func.max(SensorData.timestamp).label("timestamp"))
@@ -33,8 +33,9 @@ async def list_assets(
         .outerjoin(latest, latest.c.asset_id == Asset.id)
         .outerjoin(SensorData, (SensorData.asset_id == latest.c.asset_id) & (SensorData.timestamp == latest.c.timestamp))
     )
-    if plant_id is not None:
-        query = query.where(Asset.plant_id == plant_id)
+    plant_filter = plant_scope_filter(principal, Asset.plant_id, plant_id)
+    if plant_filter is not None:
+        query = query.where(plant_filter)
     rows = await db.execute(query.order_by(Asset.name))
     return [
         AssetRead.model_validate(asset).model_copy(update={
@@ -55,9 +56,13 @@ async def list_assets(
 async def get_asset(
     asset_id: str,
     db: AsyncSession = Depends(get_db),
-    _principal: Principal = Depends(require_roles(*WORKFLOW_READ_ROLES)),
+    principal: Principal = Depends(require_roles(*WORKFLOW_READ_ROLES)),
 ) -> AssetRead:
-    row = (await db.execute(select(Asset, Plant.code, Plant.name).join(Plant).where(Asset.id == asset_id))).first()
+    query = select(Asset, Plant.code, Plant.name).join(Plant).where(Asset.id == asset_id)
+    plant_filter = plant_scope_filter(principal, Asset.plant_id)
+    if plant_filter is not None:
+        query = query.where(plant_filter)
+    row = (await db.execute(query)).first()
     if row is None:
         raise HTTPException(status_code=404, detail="Asset not found")
     asset, plant_code, plant_name = row
@@ -82,7 +87,11 @@ async def acknowledge_alert(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_roles("operator", "reliability_engineer")),
 ) -> AssetAlertAcknowledgementRead:
-    asset = await db.scalar(select(Asset).where(Asset.id == asset_id).with_for_update())
+    query = select(Asset).where(Asset.id == asset_id)
+    plant_filter = plant_scope_filter(principal, Asset.plant_id)
+    if plant_filter is not None:
+        query = query.where(plant_filter)
+    asset = await db.scalar(query.with_for_update())
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found")
     if not asset.alert_active:
@@ -100,6 +109,42 @@ async def acknowledge_alert(
     )
 
 
+@router.post("/{asset_id}/alert/snooze", response_model=AssetAlertSnoozeRead, status_code=201)
+async def snooze_alert(
+    asset_id: uuid.UUID,
+    request: AssetAlertSnoozeRequest,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_roles("operator", "reliability_engineer")),
+) -> AssetAlertSnoozeRead:
+    query = select(Asset).where(Asset.id == asset_id)
+    plant_filter = plant_scope_filter(principal, Asset.plant_id)
+    if plant_filter is not None:
+        query = query.where(plant_filter)
+    asset = await db.scalar(query.with_for_update())
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    if not asset.alert_active:
+        raise HTTPException(status_code=409, detail="Only an open alert can be snoozed.")
+    now = datetime.now(timezone.utc)
+    snoozed_until = now + timedelta(minutes=request.minutes)
+    subject = principal.subject if principal.verified else None
+    asset.alert_snoozed_until = snoozed_until
+    asset.alert_snoozed_by = subject
+    db.add(AssetAlertSnooze(
+        asset_id=asset.id,
+        snoozed_by_sub=subject,
+        snoozed_until=snoozed_until,
+        reason=request.reason,
+    ))
+    await db.commit()
+    return AssetAlertSnoozeRead(
+        asset_id=asset.id,
+        alert_snoozed_until=snoozed_until,
+        alert_snoozed_by=subject,
+        reason=request.reason,
+    )
+
+
 @router.patch("/{asset_id}/thresholds", response_model=AssetRead)
 async def update_asset_thresholds(
     asset_id: uuid.UUID,
@@ -107,7 +152,11 @@ async def update_asset_thresholds(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_roles("reliability_engineer", "manager")),
 ) -> AssetRead:
-    asset = await db.scalar(select(Asset).where(Asset.id == asset_id).with_for_update())
+    query = select(Asset).where(Asset.id == asset_id)
+    plant_filter = plant_scope_filter(principal, Asset.plant_id)
+    if plant_filter is not None:
+        query = query.where(plant_filter)
+    asset = await db.scalar(query.with_for_update())
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found")
     old_vibration = asset.vibration_threshold_mm_s
@@ -135,9 +184,13 @@ async def update_asset_thresholds(
 async def asset_threshold_history(
     asset_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _principal: Principal = Depends(require_roles("reliability_engineer", "manager")),
+    principal: Principal = Depends(require_roles("reliability_engineer", "manager")),
 ) -> list[AssetThresholdChange]:
-    if await db.get(Asset, asset_id) is None:
+    asset_query = select(Asset).where(Asset.id == asset_id)
+    plant_filter = plant_scope_filter(principal, Asset.plant_id)
+    if plant_filter is not None:
+        asset_query = asset_query.where(plant_filter)
+    if await db.scalar(asset_query) is None:
         raise HTTPException(status_code=404, detail="Asset not found")
     rows = await db.scalars(
         select(AssetThresholdChange)
@@ -152,9 +205,13 @@ async def asset_threshold_history(
 async def asset_history(
     asset_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _principal: Principal = Depends(require_roles(*WORKFLOW_READ_ROLES)),
+    principal: Principal = Depends(require_roles(*WORKFLOW_READ_ROLES)),
 ) -> list[AssetHistoryEventRead]:
-    asset = await db.get(Asset, asset_id)
+    asset_query = select(Asset).where(Asset.id == asset_id)
+    plant_filter = plant_scope_filter(principal, Asset.plant_id)
+    if plant_filter is not None:
+        asset_query = asset_query.where(plant_filter)
+    asset = await db.scalar(asset_query)
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found")
 
@@ -244,6 +301,19 @@ async def asset_history(
             title=f"Demo scenario {event.event_type}: {event.scenario.replace('_', ' ')}",
             detail="Synthetic scenario event.",
             actor=event.actor_id or event.actor_type,
+        ))
+
+    snoozes = await db.scalars(
+        select(AssetAlertSnooze).where(AssetAlertSnooze.asset_id == asset_id)
+        .order_by(AssetAlertSnooze.created_at.desc()).limit(100)
+    )
+    for event in snoozes.all():
+        timeline.append(AssetHistoryEventRead(
+            created_at=event.created_at,
+            event_type="alert_snoozed",
+            title="Condition alert snoozed",
+            detail=f"{event.reason} · until {event.snoozed_until.isoformat()}",
+            actor=event.snoozed_by_sub,
         ))
 
     return sorted(timeline, key=lambda event: event.created_at, reverse=True)[:250]

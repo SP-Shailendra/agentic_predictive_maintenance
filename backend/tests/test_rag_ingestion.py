@@ -1,5 +1,6 @@
 from io import BytesIO
 import unittest
+from unittest.mock import patch
 
 from docx import Document
 from pypdf import PdfWriter
@@ -7,7 +8,8 @@ from pypdf import PdfWriter
 from services.chunking_service import chunk_segments
 from services.document_loader import MAX_EXTRACTED_TEXT_CHARS, DocumentLoadError, load_document
 from services.rag_evaluation import score_retrieval_case, score_retrieval_suite
-from services.rag_service import build_citation_refs, validate_citation_refs
+from services.rag_service import _reciprocal_rank_fusion, build_citation_refs, validate_citation_refs
+from services.embedding_service import rerank_documents
 
 
 class DocumentLoaderTests(unittest.TestCase):
@@ -36,9 +38,21 @@ class DocumentLoaderTests(unittest.TestCase):
         writer.add_blank_page(width=72, height=72)
         buffer = BytesIO()
         writer.write(buffer)
-        with self.assertRaises(DocumentLoadError) as raised:
-            load_document("blank.pdf", buffer.getvalue())
+        with patch("services.document_loader._ocr_pdf_page", return_value=""):
+            with self.assertRaises(DocumentLoadError) as raised:
+                load_document("blank.pdf", buffer.getvalue())
         self.assertEqual(raised.exception.code, "no_extractable_text")
+
+    def test_scanned_pdf_uses_worker_ocr_fallback(self) -> None:
+        writer = PdfWriter()
+        writer.add_blank_page(width=72, height=72)
+        buffer = BytesIO()
+        writer.write(buffer)
+        with patch("services.document_loader._ocr_pdf_page", return_value="Scanned bearing inspection") as ocr:
+            segments = load_document("scan.pdf", buffer.getvalue())
+        self.assertEqual(segments[0].text, "Scanned bearing inspection")
+        self.assertEqual(segments[0].page_number, 1)
+        ocr.assert_called_once()
 
     def test_unsupported_or_invalid_text_is_rejected(self) -> None:
         with self.assertRaisesRegex(DocumentLoadError, "Supported formats"):
@@ -75,6 +89,36 @@ class ChunkingTests(unittest.TestCase):
 
 
 class RetrievalEvaluationTests(unittest.TestCase):
+    def test_cross_encoder_scores_reorder_retrieval_candidates(self) -> None:
+        candidates = [
+            {"chunk_id": "lower", "content": "pump general maintenance"},
+            {"chunk_id": "higher", "content": "bearing wear vibration checks"},
+        ]
+
+        class FakeReranker:
+            def rerank(self, query, documents):
+                return [0.1, 0.9]
+
+        with patch("services.embedding_service._get_reranker", return_value=FakeReranker()):
+            reranked = rerank_documents("pump bearing vibration", candidates)
+
+        self.assertEqual([item["chunk_id"] for item in reranked], ["higher", "lower"])
+
+    def test_reciprocal_rank_fusion_combines_and_deduplicates_candidates(self) -> None:
+        vector_rows = [
+            {"chunk_id": "shared", "content": "semantic match"},
+            {"chunk_id": "vector-only", "content": "semantic candidate"},
+        ]
+        keyword_rows = [
+            {"chunk_id": "shared", "content": "exact identifier"},
+            {"chunk_id": "keyword-only", "content": "keyword candidate"},
+        ]
+
+        fused = _reciprocal_rank_fusion(vector_rows, keyword_rows, limit=3)
+
+        self.assertEqual([row["chunk_id"] for row in fused], ["shared", "keyword-only", "vector-only"])
+        self.assertEqual(fused[0]["content"], "semantic match")
+
     def test_recall_and_mrr_use_labeled_relevant_passages(self) -> None:
         case = {"relevant_phrases": ["bearing inspection", "lubrication procedure"]}
         result = score_retrieval_case(
@@ -95,6 +139,14 @@ class RetrievalEvaluationTests(unittest.TestCase):
         self.assertEqual(result["case_count"], 2)
         self.assertEqual(result["mean_recall_at_k"], 0.5)
         self.assertEqual(result["mean_mrr_at_k"], 0.5)
+        self.assertEqual(result["mean_ndcg_at_k"], 0.5)
+
+    def test_ndcg_penalizes_relevant_passages_ranked_late(self) -> None:
+        relevant = ["bearing procedure", "lubrication procedure"]
+        early = score_retrieval_case(relevant, ["bearing procedure", "lubrication procedure"], k=2)
+        late = score_retrieval_case(relevant, ["unrelated", "bearing procedure"], k=2)
+        self.assertEqual(early["ndcg_at_k"], 1.0)
+        self.assertLess(late["ndcg_at_k"], early["ndcg_at_k"])
 
 
 class CitationValidationTests(unittest.TestCase):

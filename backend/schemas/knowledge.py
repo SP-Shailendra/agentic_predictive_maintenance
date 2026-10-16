@@ -17,6 +17,8 @@ class KnowledgeDocumentRead(BaseModel):
     source_uri: str | None
     plant_id: uuid.UUID | None
     allowed_roles: list[str]
+    allowed_subjects: list[str]
+    allowed_groups: list[str]
     ingestion_status: str
     failure_code: str | None
     chunk_count: int

@@ -86,6 +86,7 @@ export default function App() {
   const [auditEvents, setAuditEvents] = useState([])
   const [busy, setBusy] = useState(false)
   const [acknowledgingAlert, setAcknowledgingAlert] = useState(false)
+  const [snoozingAlert, setSnoozingAlert] = useState(false)
   const [refreshing, setRefreshing] = useState(true)
   const [apiStatus, setApiStatus] = useState('checking')
   const [error, setError] = useState('')
@@ -384,6 +385,20 @@ export default function App() {
       setToast({ message: requestError.message || 'Could not acknowledge alert.', type: 'error' })
     } finally {
       setAcknowledgingAlert(false)
+    }
+  }
+
+  async function snoozeAlert() {
+    if (!selectedAsset || snoozingAlert) return
+    setSnoozingAlert(true)
+    try {
+      const result = await api.snoozeAssetAlert(selectedAsset.id, 30, 'Operator requested a temporary quiet period.')
+      await refreshAll()
+      setToast({ message: `Alert snoozed until ${dateTimeLabel(result.alert_snoozed_until)}.`, type: 'success' })
+    } catch (requestError) {
+      setToast({ message: requestError.message || 'Could not snooze alert.', type: 'error' })
+    } finally {
+      setSnoozingAlert(false)
     }
   }
 
@@ -715,7 +730,8 @@ export default function App() {
                     <p className="selected-asset-meta">{selectedAsset.location} · Criticality {selectedAsset.criticality} · Last reading {dateTimeLabel(activeReading?.timestamp)} ({ageLabel(activeReading?.timestamp)})</p>
                     {selectedAsset.alert_active && <div className="asset-alert-strip" role="status">
                       <AlertCircle size={15} aria-hidden="true" />
-                      <div className="asset-alert-copy"><strong>{selectedAsset.alert_acknowledged_at ? 'Acknowledged · recovery pending' : 'Awaiting acknowledgement'}</strong><span>Opened {dateTimeLabel(selectedAsset.alert_started_at)} · {Date.now() - new Date(selectedAsset.alert_last_reading_at).getTime() > 60000 ? 'Recovery readings stale' : `Recovery: ${selectedAsset.alert_normal_readings}/3 consecutive normal readings`}</span></div>
+                      <div className="asset-alert-copy"><strong>{selectedAsset.alert_acknowledged_at ? 'Acknowledged · recovery pending' : 'Awaiting acknowledgement'}</strong><span>Opened {dateTimeLabel(selectedAsset.alert_started_at)} · {Date.now() - new Date(selectedAsset.alert_last_reading_at).getTime() > 60000 ? 'Recovery readings stale' : `Recovery: ${selectedAsset.alert_normal_readings}/3 consecutive normal readings`}{selectedAsset.alert_snoozed_until && new Date(selectedAsset.alert_snoozed_until) > new Date() ? ` · Snoozed until ${dateTimeLabel(selectedAsset.alert_snoozed_until)}` : ''}</span></div>
+                      {hasRole('operator', 'reliability_engineer') && <button className="button button-quiet" type="button" onClick={snoozeAlert} disabled={snoozingAlert}><Clock3 size={14} />{snoozingAlert ? 'Snoozing...' : 'Snooze 30 min'}</button>}
                       {hasRole('operator', 'reliability_engineer') && !selectedAsset.alert_acknowledged_at && <button className="button button-quiet" type="button" onClick={acknowledgeAlert} disabled={acknowledgingAlert}><Check size={14} />{acknowledgingAlert ? 'Acknowledging...' : 'Acknowledge alert'}</button>}
                     </div>}
                     <div className="asset-quality-row" aria-live="polite">

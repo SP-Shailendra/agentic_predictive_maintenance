@@ -16,11 +16,14 @@ from agents.edge_simulator import seed_demo_assets, simulator_loop
 from core.config import settings
 from core.database import engine
 from core.migrations import upgrade_database
+from core.observability import instrument_fastapi, shutdown_telemetry
 from routers import assets, chat, knowledge, plants, simulator, telemetry, workflow
 from services.rag_service import initialize_knowledge_store
 from services.outbox_worker import outbox_worker_loop
 from services.approval_sla_worker import approval_sla_worker_loop
 from services.notification_worker import notification_worker_loop
+from services.cmms_status_worker import cmms_status_worker_loop
+from services.document_ingestion_worker import document_ingestion_worker_loop
 
 
 @asynccontextmanager
@@ -44,19 +47,22 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     outbox_task = asyncio.create_task(outbox_worker_loop(), name="cmms-outbox-worker")
     sla_task = asyncio.create_task(approval_sla_worker_loop(), name="approval-sla-worker")
     notification_task = asyncio.create_task(notification_worker_loop(), name="notification-outbox-worker")
+    cmms_status_task = asyncio.create_task(cmms_status_worker_loop(), name="cmms-status-worker")
+    document_ingestion_task = asyncio.create_task(document_ingestion_worker_loop(), name="knowledge-ingestion-worker")
     try:
         yield
     finally:
-        for task in (simulator_task, outbox_task, sla_task, notification_task):
+        for task in (simulator_task, outbox_task, sla_task, notification_task, cmms_status_task, document_ingestion_task):
             if task:
                 task.cancel()
-        for task in (simulator_task, outbox_task, sla_task, notification_task):
+        for task in (simulator_task, outbox_task, sla_task, notification_task, cmms_status_task, document_ingestion_task):
             if task:
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
         await engine.dispose()
+        shutdown_telemetry()
 
 
 app = FastAPI(
@@ -65,6 +71,7 @@ app = FastAPI(
     description="Human-approved agentic condition monitoring and maintenance workflow API.",
     lifespan=lifespan,
 )
+instrument_fastapi(app)
 app.include_router(assets.router, prefix="/api")
 app.include_router(plants.router, prefix="/api")
 app.include_router(telemetry.router, prefix="/api")

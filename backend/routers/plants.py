@@ -3,7 +3,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import get_db
-from core.security import Principal, require_api_key, require_roles, WORKFLOW_READ_ROLES
+from core.security import Principal, plant_scope_filter, require_api_key, require_roles, WORKFLOW_READ_ROLES
 from models import Asset, Plant, WorkOrder
 from schemas.asset import PlantRead
 
@@ -35,7 +35,7 @@ async def list_plants(
         .group_by(Asset.plant_id)
         .subquery()
     )
-    rows = await db.execute(
+    query = (
         select(
             Plant,
             func.coalesce(asset_stats.c.asset_count, 0),
@@ -46,6 +46,10 @@ async def list_plants(
         .outerjoin(work_order_stats, work_order_stats.c.plant_id == Plant.id)
         .order_by(Plant.code)
     )
+    plant_filter = plant_scope_filter(_principal, Plant.id)
+    if plant_filter is not None:
+        query = query.where(plant_filter)
+    rows = await db.execute(query)
     return [
         PlantRead.model_validate(plant).model_copy(update={
             "asset_count": asset_count,

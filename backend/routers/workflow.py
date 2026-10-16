@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from math import ceil
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import and_, func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,9 +12,18 @@ from agents.workflow_graph import workflow_graph
 from core.config import settings
 from core.database import get_db
 from core.audit import append_workflow_event
-from core.security import Principal, reject_self_approval, require_api_key, require_roles, WORKFLOW_READ_ROLES
+from core.security import (
+    Principal,
+    plant_scope_filter,
+    reject_self_approval,
+    require_api_key,
+    require_roles,
+    WORKFLOW_READ_ROLES,
+)
 from models import Asset, CMMSOutbox, SensorData, WorkOrder, WorkflowEvent
 from services.simulator_scenarios import scenario_is_active_or_recent
+from services.audit_pack import build_work_order_audit_pack
+from services.closeout_knowledge import enqueue_closed_work_order_knowledge
 from services.workflow_notifications import enqueue_workflow_notification
 from schemas.workflow import (
     WorkflowAssignment,
@@ -39,6 +48,21 @@ OPEN_INVESTIGATION_STATUSES = (
 )
 
 
+def _work_order_scope_filter(principal: Principal, plant_id: uuid.UUID | None = None):
+    plant_filter = plant_scope_filter(principal, Asset.plant_id, plant_id)
+    if plant_filter is None:
+        return None
+    return WorkOrder.asset_id.in_(select(Asset.id).where(plant_filter))
+
+
+async def _locked_work_order(db: AsyncSession, work_order_id: uuid.UUID, principal: Principal) -> WorkOrder | None:
+    query = select(WorkOrder).where(WorkOrder.id == work_order_id)
+    scope_filter = _work_order_scope_filter(principal)
+    if scope_filter is not None:
+        query = query.where(scope_filter)
+    return await db.scalar(query.with_for_update())
+
+
 @router.get("", response_model=list[WorkflowRead])
 async def list_workflows(
     plant_id: uuid.UUID | None = Query(default=None),
@@ -46,8 +70,9 @@ async def list_workflows(
     _principal: Principal = Depends(require_roles(*WORKFLOW_READ_ROLES)),
 ) -> list[WorkOrder]:
     query = select(WorkOrder)
-    if plant_id is not None:
-        query = query.join(Asset, Asset.id == WorkOrder.asset_id).where(Asset.plant_id == plant_id)
+    scope_filter = _work_order_scope_filter(_principal, plant_id)
+    if scope_filter is not None:
+        query = query.where(scope_filter)
     rows = await db.scalars(query.order_by(WorkOrder.created_at.desc()).limit(100))
     return list(rows.all())
 
@@ -101,8 +126,8 @@ async def my_work(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_roles("technician")),
 ) -> list[WorkOrder]:
-    rows = await db.scalars(
-        select(WorkOrder)
+    query = (
+        select(WorkOrder).join(Asset, Asset.id == WorkOrder.asset_id)
         .where(
             WorkOrder.assigned_to_sub == principal.subject,
             WorkOrder.status.in_(("processing", "awaiting_approval", "dispatch_queued", "dispatching", "dispatch_retry", "dispatched", "in_progress", "completed")),
@@ -110,6 +135,10 @@ async def my_work(
         .order_by(WorkOrder.updated_at.desc())
         .limit(200)
     )
+    scope_filter = plant_scope_filter(principal, Asset.plant_id)
+    if scope_filter is not None:
+        query = query.where(scope_filter)
+    rows = await db.scalars(query)
     return list(rows.all())
 
 
@@ -119,7 +148,11 @@ async def get_workflow(
     db: AsyncSession = Depends(get_db),
     _principal: Principal = Depends(require_roles(*WORKFLOW_READ_ROLES)),
 ) -> WorkflowRead:
-    work_order = await db.get(WorkOrder, work_order_id)
+    query = select(WorkOrder).where(WorkOrder.id == work_order_id)
+    scope_filter = _work_order_scope_filter(_principal)
+    if scope_filter is not None:
+        query = query.where(scope_filter)
+    work_order = await db.scalar(query)
     if work_order is None:
         raise HTTPException(status_code=404, detail="Workflow not found")
     result = WorkflowRead.model_validate(work_order)
@@ -133,7 +166,11 @@ async def assign_work_order(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_roles("manager", "reliability_engineer")),
 ) -> WorkflowRead:
-    work_order = await db.scalar(select(WorkOrder).where(WorkOrder.id == work_order_id).with_for_update())
+    query = select(WorkOrder).where(WorkOrder.id == work_order_id)
+    scope_filter = _work_order_scope_filter(principal)
+    if scope_filter is not None:
+        query = query.where(scope_filter)
+    work_order = await db.scalar(query.with_for_update())
     if work_order is None:
         raise HTTPException(status_code=404, detail="Workflow not found")
     if work_order.status not in ("processing", "awaiting_approval", "dispatch_queued", "dispatching", "dispatch_retry", "dispatched", "in_progress"):
@@ -159,7 +196,11 @@ async def start_workflow(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_roles("operator", "reliability_engineer")),
 ) -> WorkOrder:
-    asset = await db.scalar(select(Asset).where(Asset.id == payload.asset_id).with_for_update())
+    asset_query = select(Asset).where(Asset.id == payload.asset_id)
+    plant_filter = plant_scope_filter(principal, Asset.plant_id)
+    if plant_filter is not None:
+        asset_query = asset_query.where(plant_filter)
+    asset = await db.scalar(asset_query.with_for_update())
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found")
     existing = await db.scalar(
@@ -202,6 +243,8 @@ async def start_workflow(
         "location": asset.location,
         "plant_id": str(asset.plant_id),
         "knowledge_roles": sorted(principal.roles),
+        "knowledge_subject": principal.subject if principal.verified else "",
+        "knowledge_groups": sorted(principal.groups or []),
         "alert_type": payload.alert_type,
         "severity": payload.severity,
         "message": payload.message,
@@ -235,6 +278,15 @@ async def start_workflow(
             "compliance_check": result.get("compliance_check"),
             "evidence_status": result.get("evidence_status", "unavailable"),
             "evidence_error_code": result.get("evidence_error_code"),
+            "citation_verification_status": result.get("citation_verification_status", "unavailable"),
+            "citation_checks": [
+                {
+                    "claim": check.get("claim"),
+                    "verdict": check.get("verdict"),
+                    "chunk_ids": check.get("chunk_ids", []),
+                }
+                for check in result.get("citation_checks", [])
+            ],
             "evidence_sources": [
                 {
                     "chunk_id": source.get("chunk_id"),
@@ -262,9 +314,7 @@ async def approve_workflow(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_roles("approver")),
 ) -> WorkOrder:
-    work_order = await db.scalar(
-        select(WorkOrder).where(WorkOrder.id == work_order_id).with_for_update()
-    )
+    work_order = await _locked_work_order(db, work_order_id, principal)
     if work_order is None:
         raise HTTPException(status_code=404, detail="Workflow not found")
     if work_order.status != "awaiting_approval":
@@ -350,9 +400,7 @@ async def advance_work_order_lifecycle(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_roles("technician", "operator", "reliability_engineer")),
 ) -> WorkOrder:
-    work_order = await db.scalar(
-        select(WorkOrder).where(WorkOrder.id == work_order_id).with_for_update()
-    )
+    work_order = await _locked_work_order(db, work_order_id, principal)
     if work_order is None:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
@@ -400,9 +448,7 @@ async def close_out_work_order(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_roles("technician", "operator", "reliability_engineer")),
 ) -> WorkOrder:
-    work_order = await db.scalar(
-        select(WorkOrder).where(WorkOrder.id == work_order_id).with_for_update()
-    )
+    work_order = await _locked_work_order(db, work_order_id, principal)
     if work_order is None:
         raise HTTPException(status_code=404, detail="Workflow not found")
     if work_order.status != "completed":
@@ -425,6 +471,7 @@ async def close_out_work_order(
         {"agent": "Technician", "message": "Close-out recorded with confirmed root cause and alert usefulness.", "status": "complete"},
     ]
     work_order.workflow_state = state
+    await enqueue_closed_work_order_knowledge(db, work_order)
     await append_workflow_event(
         db,
         work_order,
@@ -449,9 +496,7 @@ async def reject_workflow(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_roles("approver")),
 ) -> WorkOrder:
-    work_order = await db.scalar(
-        select(WorkOrder).where(WorkOrder.id == work_order_id).with_for_update()
-    )
+    work_order = await _locked_work_order(db, work_order_id, principal)
     if work_order is None:
         raise HTTPException(status_code=404, detail="Workflow not found")
     if work_order.status != "awaiting_approval":
@@ -487,7 +532,11 @@ async def workflow_events(
     db: AsyncSession = Depends(get_db),
     _principal: Principal = Depends(require_roles(*WORKFLOW_READ_ROLES)),
 ) -> list[WorkflowEvent]:
-    if await db.get(WorkOrder, work_order_id) is None:
+    order_query = select(WorkOrder).where(WorkOrder.id == work_order_id)
+    scope_filter = _work_order_scope_filter(_principal)
+    if scope_filter is not None:
+        order_query = order_query.where(scope_filter)
+    if await db.scalar(order_query) is None:
         raise HTTPException(status_code=404, detail="Workflow not found")
     rows = await db.scalars(
         select(WorkflowEvent)
@@ -495,6 +544,32 @@ async def workflow_events(
         .order_by(WorkflowEvent.created_at, WorkflowEvent.id)
     )
     return list(rows.all())
+
+
+@router.get("/{work_order_id}/audit-pack.pdf")
+async def download_work_order_audit_pack(
+    work_order_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_roles("manager", "reliability_engineer", "approver")),
+) -> Response:
+    query = select(WorkOrder).where(WorkOrder.id == work_order_id)
+    scope_filter = _work_order_scope_filter(principal)
+    if scope_filter is not None:
+        query = query.where(scope_filter)
+    work_order = await db.scalar(query)
+    if work_order is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    events = await db.scalars(
+        select(WorkflowEvent)
+        .where(WorkflowEvent.work_order_id == work_order_id)
+        .order_by(WorkflowEvent.created_at, WorkflowEvent.id)
+    )
+    pdf = build_work_order_audit_pack(work_order, events.all())
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="fieldnote-{work_order_id}-audit.pdf"'},
+    )
 
 
 @router.get("/metrics/maintenance", response_model=WorkflowMetricsRead)
@@ -527,9 +602,10 @@ async def maintenance_metrics(
     )
     status_query = select(WorkOrder.status, func.count()).where(pilot_order).group_by(WorkOrder.status)
     closed_count_query = select(func.count()).select_from(WorkOrder).where(WorkOrder.status == "closed", pilot_order)
-    if plant_id is not None:
+    plant_filter = plant_scope_filter(_principal, Asset.plant_id, plant_id)
+    if plant_filter is not None:
         def scope_to_plant(query):
-            return query.join(Asset, Asset.id == WorkOrder.asset_id).where(Asset.plant_id == plant_id)
+            return query.join(Asset, Asset.id == WorkOrder.asset_id).where(plant_filter)
 
         usefulness_query = scope_to_plant(usefulness_query)
         root_cause_query = scope_to_plant(root_cause_query)

@@ -46,8 +46,8 @@ flowchart LR
 		TelemetryIngest[Validated telemetry ingestion]
 		WorkflowAPI[Workflow and approval API]
 		KnowledgeAPI[Knowledge document API]
-		DocumentPipeline[Parser → chunker → hash embedding]
-		RAG[Role/plant-filtered vector retrieval]
+		DocumentPipeline[Parser → chunker → FastEmbed]
+		RAG[ACL-filtered hybrid retrieval with RRF]
 		ChatAPI[Read-only operational tools + RAG]
 		Graph[Fixed LangGraph Detect → Diagnose → Decide → Dispatch → Document]
 		ApprovalGate[Human approval gate]
@@ -66,7 +66,7 @@ flowchart LR
 	end
 
 	Simulator[Built-in synthetic telemetry simulator]
-	ProtocolBoundary[OPC UA / MQTT bridge boundary, not bundled]
+	ProtocolBoundary[Configurable OPC UA / MQTT gateway + historian backfill]
 	Groq[Optional Groq inference]
 	CMMS[Configured CMMS HTTP boundary]
 	NotifyChannels[Optional SMTP / Slack / Teams webhook]
@@ -116,7 +116,7 @@ flowchart LR
 
 | Layer | Responsibilities | Implementation in this repository |
 | --- | --- | --- |
-| Edge | Read equipment signals and forward events | `backend/agents/edge_simulator.py`; HTTP ingest contract is the adapter boundary for OPC UA and MQTT Sparkplug B |
+| Edge | Read equipment signals and forward events | `backend/agents/edge_simulator.py`; separate `backend/scripts/run_edge_gateway.py` and `backfill_telemetry.py` normalize source data into the validated HTTP ingest contract |
 | Plant / gateway | Validate telemetry, persist time-series data, run agent workflow, expose APIs | FastAPI routers, SQLAlchemy async sessions, TimescaleDB hypertable, LangGraph workflow |
 | Cloud / enterprise | Retrieve maintenance context, infer diagnoses, create enterprise work orders, support operator review | pgvector-backed knowledge table, optional Groq inference, CMMS service, React dashboard and approval controls |
 
@@ -171,9 +171,9 @@ sequenceDiagram
 	API-->>UI: Answer, evidence state, and permitted source references
 ```
 
-The API validates telemetry and persists it before any workflow starts. Diagnosis is an explicit operator action, not a simulator side effect. Knowledge upload is synchronous in the current implementation: the API extracts text, chunks it, assigns the demo hash vector, and stores document/chunk state before returning. RAG filters indexed chunks by allowed roles and optional plant query scope; plant scope is not an identity entitlement. Workflow citations are server-built from retrieved chunk IDs and stored without copying source passage text into audit events. Only an authorized approval reaches the transactional CMMS outbox; the separate SLA and notification workers use row locks/leases for multi-worker safety.
+The API validates telemetry and persists it before any workflow starts. Diagnosis is an explicit operator action, not a simulator side effect. Knowledge upload retains the original bytes and returns a processing document; a leased background worker performs PDF/DOCX/text extraction, OCR fallback for scanned PDF pages, chunking, and normalized FastEmbed vector generation. Retrieval combines model-matched vector candidates with PostgreSQL full-text candidates using reciprocal-rank fusion and an optional cross-encoder, while enforcing role, subject/group, and plant-entitlement filters. OIDC plant and group access comes from configured claims; development and service identities remain explicitly unscoped. Human-confirmed close-outs become searchable plant-scoped knowledge only when the source order is not simulated. Workflow citations are server-built from retrieved chunk IDs and stored without copying source passage text into audit events. Only an authorized approval reaches the transactional CMMS outbox; background workers use row locks/leases for multi-worker safety.
 
-**Current RAG implementation boundary:** `knowledge_chunks.embedding` is `vector(384)`, but vectors are deterministic token hashes, not semantic embeddings. Search is vector-distance only; hybrid keyword search, reranking, OCR, original-file storage, and claim-level citation entailment are not implemented. The retrieval evaluation fixture provides a baseline, not a quality certification.
+**Current RAG implementation boundary:** `knowledge_chunks.embedding` is `vector(384)` using the configurable `BAAI/bge-small-en-v1.5` FastEmbed model by default. Hybrid vector/full-text ranking, optional cross-encoder reranking, OCR fallback, original-file retention, role/subject/group/plant ACLs, confirmed real close-out indexing, and model-based claim-to-passage checks are implemented. Citation checks are advisory and fail to `unavailable` without the verifier; they are not a formal entailment guarantee. The four-case bundled evaluation fixture is a smoke test, not a quality certification; add reviewed technician queries and reindex existing chunks after upgrading or changing the embedding model.
 
 ## Repository map
 
@@ -266,7 +266,7 @@ agentic_predictive_maintenance/       # Clone directory; an existing local check
 - **Audit and delivery:** Workflow events carry actor/role attribution in a per-work-order SHA-256 chain with database mutation-blocking triggers. Approval and CMMS outbox enqueue commit together; the worker leases with `SKIP LOCKED`, retries bounded failures, and uses an idempotency key. A separate row-locked SLA worker records one overdue event per approval. Optional SMTP and incoming-webhook notifications use a deduplicated retry outbox and contain only asset tag, status, and a deep link. This is tamper-evident, not protection against a database superuser.
 - **Telemetry contract:** Single and 1–500 item batch ingest reject unknown/non-finite/out-of-range fields, timezone-naive/far-future timestamps, and duplicate source IDs. Older backfills are stored without overwriting current asset status.
 - **Service operations:** `/health`, `/ready`, and protected Prometheus `/metrics`; CORS, API-key compatibility for service clients, OIDC/JWKS roles, per-process API/chat rate limits, non-root backend container, mounted secret-file support, Alembic migrations, telemetry retention opt-in, and PowerShell backup/restore/restore-verification scripts.
-- **External boundaries:** OPC UA/MQTT Sparkplug B and historian clients are not included. The generic CMMS HTTP boundary requires vendor validation; simulator scenarios are always routed to simulated references. No machinery control or safety interlock path exists.
+- **External boundaries:** Generic OPC UA/MQTT and historian adapters are included but require site tag maps, credentials, certificates, and vendor validation. The generic CMMS HTTP boundary requires vendor validation; simulator scenarios are always routed to simulated references. No machinery control or safety interlock path exists.
 
 ### Simulator scenarios
 
@@ -335,9 +335,9 @@ Approval and rejection are separate API operations. OIDC bearer claims determine
 - `simulator_scenario_events`: start/stop/completion/rejected-sample events with actor type, subject, roles, verification flag, and scenario details.
 - `notification_outbox`: deduplicated approval/dispatch notifications, channel, retry/lease state, and delivery outcome.
 - `knowledge_documents`: uploaded document identity, SHA-256 checksum, descriptive metadata, plant scope, allowed roles, ingestion status, safe failure code, and chunk count.
-- `knowledge_chunks`: legacy seeded maintenance notes plus ingested passages, a `vector(384)` embedding, JSON metadata, and nullable `document_id`, `chunk_index`, and `page_number` provenance. Startup seeds sample notes only when the table is empty; legacy chunks remain unlinked and readable.
+- `knowledge_chunks`: seeded maintenance notes plus ingested passages, a `vector(384)` embedding, the embedding model name, JSON metadata, and nullable `document_id`, `chunk_index`, and `page_number` provenance. Startup seeds sample notes only when the table is empty; legacy chunks remain keyword-searchable until reindexed.
 
-The local embedding implementation is deterministic token hashing for a runnable demo; it is not a semantic embedding model. The baseline evaluation fixture is `backend/tests/fixtures/rag_retrieval_eval.json`; with a disposable database containing the seeded notes, measure Recall@K and MRR using `RAG_EVAL_DATABASE_URL=<disposable test/eval database URL> python -m scripts.evaluate_rag --k 5` from `backend/`. The runner refuses database names without `test` or `eval`. Replace the hash vectors with a validated embedding provider and re-index before treating rankings as meaningful. Schema changes are versioned with Alembic. A complete legacy schema is stamped at the initial baseline before newer migrations; a partially initialized legacy schema stops startup for manual review.
+The local embedding model defaults to `BAAI/bge-small-en-v1.5` through FastEmbed and downloads on first use. The baseline evaluation fixture is `backend/tests/fixtures/rag_retrieval_eval.json`; with a disposable database containing the seeded notes, measure Recall@K and MRR using `RAG_EVAL_DATABASE_URL=<disposable test/eval database URL> python -m scripts.evaluate_rag --k 5` from `backend/`. Supply a labeled real-query JSON file with `--cases <path>`. The runner refuses database names without `test` or `eval`. After upgrading or changing `EMBEDDING_MODEL_NAME`, run `python -m scripts.reindex_knowledge_embeddings --confirm` from `backend/`; reindexing processes chunks in resumable batches. Schema changes are versioned with Alembic. A complete legacy schema is stamped at the initial baseline before newer migrations; a partially initialized legacy schema stops startup for manual review.
 
 ## Run with Docker
 
@@ -409,9 +409,17 @@ Values are loaded by Pydantic Settings from environment variables and `.env`. Th
 | `OIDC_AUDIENCE` | Empty | API audience expected in verified bearer-token `aud` claims; required in production. |
 | `OIDC_JWKS_URL` | Empty | HTTPS JSON Web Key Set URL used to verify token signatures; required in production. |
 | `OIDC_ROLES_CLAIM` | `roles` | Dot-separated token claim path for recognized roles: `operator`, `reliability_engineer`, `approver`, `manager`, `technician`. |
+| `OIDC_PLANTS_CLAIM` | `plant_ids` | Dot-separated token claim path containing an array of entitled plant UUIDs. Missing/invalid membership fails closed for OIDC users. |
+| `OIDC_GROUPS_CLAIM` | `groups` | Dot-separated token claim path containing group identifiers used by knowledge document ACLs. |
+| `OIDC_GROUPS_CLAIM` | `groups` | Dot-separated token claim path containing document ACL group identifiers. |
 | `METRICS_API_KEY` | Empty | Required for `/metrics` outside development; send it as `X-Metrics-API-Key`. |
 | `CMMS_API_URL` | Empty | Optional HTTPS endpoint receiving an approved work-order JSON payload |
 | `CMMS_API_TOKEN` | Empty | Optional bearer token for the configured CMMS; required in production |
+| `CMMS_STATUS_URL` | Empty | Optional HTTPS status endpoint template; use `{reference}` for the escaped external work-order reference. Enables audited status polling. |
+| `CMMS_STATUS_POLL_SECONDS` | `60` | Minimum interval between external status polls for each work order; configured range is 10–3600 seconds. |
+| `CMMS_STATUS_MAP` | `{"open":"dispatched","released":"dispatched","in_progress":"in_progress","completed":"completed","closed":"completed"}` | JSON map from external CMMS statuses to monotonic Fieldnote states (`dispatched`, `in_progress`, `completed`). |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Empty | Optional OTLP/HTTP traces endpoint. Tracing is disabled when unset. |
+| `OTEL_SERVICE_NAME` | `fieldnote-backend` | OpenTelemetry service name. |
 | `CORS_ORIGINS` | `http://localhost:5173,http://localhost:4173` | Comma-separated allowed browser origins |
 | `SIMULATOR_ENABLED` | `true` | Start or disable the periodic telemetry simulator |
 | `SIMULATOR_INTERVAL_SECONDS` | `5` | Simulator polling interval; values below one second are clamped to one second |
@@ -420,6 +428,11 @@ Values are loaded by Pydantic Settings from environment variables and `.env`. Th
 | `DEFAULT_VIBRATION_THRESHOLD_MM_S` | `7.1` | Fallback demo advisory threshold when an asset has no override. |
 | `DEFAULT_TEMPERATURE_THRESHOLD_C` | `85` | Fallback demo advisory threshold when an asset has no override. |
 | `KNOWLEDGE_MAX_UPLOAD_MB` | `10` | Maximum size for one knowledge-document upload; configured range is 1–100 MB. |
+| `EMBEDDING_MODEL_NAME` | `BAAI/bge-small-en-v1.5` | FastEmbed model used for document and query vectors; model output must remain 384-dimensional. The model is downloaded on first use. |
+| `RAG_RERANKER_MODEL_NAME` | Empty | Optional FastEmbed cross-encoder model. Leave unset until paired evaluation on technician queries shows gains. |
+| `KNOWLEDGE_OCR_ENABLED` | `true` | Enables OCR fallback for image-only PDF pages in the background indexing worker. |
+| `RAG_RERANKER_MODEL_NAME` | Empty | Optional FastEmbed cross-encoder. Keep unset until paired evaluation on reviewed technician queries shows retrieval gains. |
+| `KNOWLEDGE_OCR_ENABLED` | `true` | Enables page-image OCR fallback on the background worker. The backend image includes Tesseract; scanned pages fail clearly if OCR dependencies are unavailable. |
 | `APPROVAL_STALE_AFTER_MINUTES` | `60` | Marks an approval stale after this diagnosis age; asset-normalization and changed telemetry can also mark it stale. Acknowledgement is still required only for the stale reasons returned by the API. |
 | `APPROVAL_SLA_MINUTES` | `60` | Age at which an awaiting approval is flagged overdue and audited. |
 | `FRONTEND_BASE_URL` | `http://localhost:4173` | Base URL used to form asset/work-order links in notifications. |
@@ -455,6 +468,7 @@ Interactive OpenAPI docs are available at <http://localhost:8000/docs> when the 
 | `GET /api/assets?plant_id={plant_id}` | Filter assets to a plant |
 | `GET /api/assets/{asset_id}` | Read one asset, its plant, and latest readings |
 | `POST /api/assets/{asset_id}/alert/acknowledge` | Operator/reliability engineer acknowledges an open condition alert; clears only after fresh confirmed recovery, otherwise remains open |
+| `POST /api/assets/{asset_id}/alert/snooze` | Operator/reliability engineer snoozes an open alert for 5 minutes–24 hours; the alert remains active and the action is recorded in asset history |
 | `PATCH /api/assets/{asset_id}/thresholds` | Reliability engineer/manager updates per-asset advisory limits with a required reason |
 | `GET /api/assets/{asset_id}/threshold-history` | Read the asset's threshold change history |
 | `GET /api/assets/{asset_id}/history` | Read workflow, threshold, scenario, and telemetry-derived condition history |
@@ -463,13 +477,13 @@ Interactive OpenAPI docs are available at <http://localhost:8000/docs> when the 
 
 | Method and path | Purpose |
 | --- | --- |
-| `POST /api/knowledge/documents` | Manager/reliability engineer uploads PDF, DOCX, TXT, or Markdown as `multipart/form-data`; accepts document type, manufacturer, asset type, revision, optional source URI/plant ID, and repeated `allowed_roles` fields |
+| `POST /api/knowledge/documents` | Manager/reliability engineer queues PDF, DOCX, TXT, or Markdown original bytes and returns HTTP 202; accepts document metadata and repeated `allowed_roles`, `allowed_subjects`, and `allowed_groups` fields |
 | `GET /api/knowledge/documents?plant_id={plant_id}` | List document metadata visible to the caller's roles; a plant filter includes shared and matching-plant documents |
 | `GET /api/knowledge/documents/{document_id}?plant_id={plant_id}` | Read one visible document's ingestion status and metadata; plant-scoped documents require matching plant context; inaccessible documents return 404 |
 | `GET /api/knowledge/documents/{document_id}/chunks?plant_id={plant_id}&limit=10&offset=0` | Read a paginated preview of indexed passages for an authorized document |
 | `GET /api/knowledge/chunks/{chunk_id}?plant_id={plant_id}` | Read one cited passage with document/revision/page/section metadata after role and plant-scope checks |
 
-If `allowed_roles` is omitted, the upload is visible to all current Fieldnote read roles. Retrieval applies the document role filter and, when provided, plant filter in SQL before returning chunks to chat or diagnosis. An unscoped portfolio query can retrieve all role-authorized plant documents; a plant-scoped query can retrieve only shared or matching-plant documents. **Plant scope is a query filter, not a per-user entitlement:** OIDC currently has no configured plant-membership claim/mapping, so do not rely on it to isolate confidential plants. Re-uploading identical bytes for an indexed/processing document returns 409; a failed checksum may be re-uploaded to retry.
+If `allowed_roles` is omitted, the upload is visible to all current Fieldnote read roles. Optional subject/group lists further restrict visibility; role and identity checks are combined, and plant entitlement is independently enforced in SQL. OIDC users can see shared documents plus plant-scoped documents for UUIDs in `OIDC_PLANTS_CLAIM`; uploads must name an entitled plant. Missing or malformed plant claims grant no plant access. Re-uploading identical bytes for an indexed/processing document returns 409; failed indexing can be retried by re-uploading the same checksum.
 
 ### Telemetry
 
@@ -479,6 +493,22 @@ If `allowed_roles` is omitted, the upload is visible to all current Fieldnote re
 | `GET /api/telemetry/{asset_id}?limit=60` | Return readings for an asset in timestamp order; `limit` is 1–500 |
 | `POST /api/telemetry/ingest` | Validate and store one reading; accepts optional `source_event_id` for idempotency and updates current asset status only for the newest reading |
 | `POST /api/telemetry/ingest/batch` | Validate and ingest 1–500 readings; duplicate source event IDs are skipped and reported |
+
+### Evaluation and integrations
+
+From `backend/`, train and holdout-evaluate the healthy-baseline detector against synthetic simulator labels:
+
+```powershell
+python -m scripts.evaluate_baseline_detector --samples-per-scenario 250 --output var/healthy-baseline-detector.joblib
+```
+
+These scores describe synthetic scenario separation only, not field performance. For semantic retrieval, run `python -m scripts.reindex_knowledge_embeddings --confirm` after the first upgrade or any model change. A technician query file is a JSON array with reviewed relevant source phrases, for example `{ "id": "case-001", "query": "<real technician question>", "relevant_phrases": ["<reviewed passage text>"] }`; do not add sensitive production queries without approval. Evaluate it on a disposable database with `RAG_EVAL_DATABASE_URL=<disposable test/eval database URL> python -m scripts.evaluate_rag --cases <path-to-json> --k 5`. If `RAG_RERANKER_MODEL_NAME` is configured, add `--compare-reranker` to report baseline and reranked Recall@K, MRR, and nDCG deltas before enabling reranking for requests.
+
+Index eligible historical real close-outs once with `python -m scripts.index_closed_work_orders --confirm`; simulated work orders are excluded. Newly closed real orders are queued automatically.
+
+Run the generic edge gateway as a separate process with `FIELDNOTE_API_URL` and `API_KEY`, plus `MQTT_BROKER_HOST`/`MQTT_TOPIC` and/or `OPC_UA_ENDPOINT`/`OPC_UA_NODE_MAP`. MQTT payloads must match the telemetry schema; OPC UA node maps are JSON arrays containing `asset_id` and the four signal node IDs. Backfill a timestamped CSV, JSON, JSONL, or NDJSON historian export using `python -m scripts.backfill_telemetry <file> --batch-size 500`. The backfill is ordered by asset and timestamp and uses idempotent event IDs.
+
+Set `CMMS_STATUS_URL` to a template such as `https://cmms.example/api/work-orders/{reference}` to enable polling; external transitions are persisted and hash-chain audited. Configure `OTEL_EXPORTER_OTLP_ENDPOINT` to enable traces. The PDF audit pack is available from each work-order review modal and at `GET /api/workflows/{work_order_id}/audit-pack.pdf` for managers, reliability engineers, and approvers.
 
 Example telemetry request:
 
@@ -494,7 +524,7 @@ Example telemetry request:
 }
 ```
 
-The `asset_id` must identify a registered asset. Numeric validation bounds are vibration `0..500 mm/s`, temperature `-50..500 °C`, pressure `0..2000 bar`, and RPM `0..100000`; non-finite values, unknown fields, timezone-naive timestamps, and timestamps over five minutes in the future are rejected. The timestamp is optional and defaults to UTC now. `source` defaults to `external`. Optional `source_event_id` is unique per asset/timestamp and can be used by bridges for retry deduplication. This is a normalized ingestion boundary, not an included OPC UA or MQTT/Sparkplug B client; protocol-specific commissioning and tag mapping remain site-specific.
+The `asset_id` must identify a registered asset. Numeric validation bounds are vibration `0..500 mm/s`, temperature `-50..500 °C`, pressure `0..2000 bar`, and RPM `0..100000`; non-finite values, unknown fields, timezone-naive timestamps, and timestamps over five minutes in the future are rejected. The timestamp is optional and defaults to UTC now. `source` defaults to `external`. Optional `source_event_id` is unique per asset/timestamp and can be used by bridges for retry deduplication. The generic OPC UA/MQTT gateway and historian file backfill normalize into this validated ingest contract; protocol commissioning and tag mapping remain site-specific.
 
 ### Simulation scenarios
 
@@ -556,7 +586,7 @@ Approval requests may add `"acknowledge_stale": true`. The API returns HTTP 409 
 
 `APPROVAL_SLA_MINUTES` flags an awaiting work order overdue without changing its approval status. A row-locked background job records `approval_overdue` once and updates the existing in-app bell/drawer. SMTP and incoming webhook channels are disabled unless configured. External messages contain only asset tag, status, and a `#workflow/{id}` link. Database uniqueness and stable event keys prevent duplicate queue entries; Slack/Teams/SMTP do not all expose idempotency APIs, so a remote endpoint that accepts a message but loses its response can still cause a duplicate on retry.
 
-Statuses include `processing`, `awaiting_approval`, `blocked`, `dispatch_queued`, `dispatching`, `dispatch_retry`, `dispatch_failed`, `dispatched`, `rejected`, `in_progress`, `completed`, and `closed`. The worker claims outbox entries using row locks/`SKIP LOCKED`, retries with bounded exponential backoff, and sends the stable work-order ID as an idempotency key. End-to-end exactly-once delivery still depends on the target CMMS honoring that key. With no `CMMS_API_URL`, the worker returns a `SIM-...` reference. The CMMS response `id` or `work_order_id` is the acceptance timestamp used for the approval-to-dispatch metric; vendor status synchronization is not implemented.
+Statuses include `processing`, `awaiting_approval`, `blocked`, `dispatch_queued`, `dispatching`, `dispatch_retry`, `dispatch_failed`, `dispatched`, `rejected`, `in_progress`, `completed`, and `closed`. The worker claims outbox entries using row locks/`SKIP LOCKED`, retries with bounded exponential backoff, and sends the stable work-order ID as an idempotency key. End-to-end exactly-once delivery still depends on the target CMMS honoring that key. With no `CMMS_API_URL`, the worker returns a `SIM-...` reference. When `CMMS_STATUS_URL` is set, mapped external status changes are persisted and hash-chain audited; vendor payloads and transition maps still require validation.
 
 Manager metrics are computed from persisted close-outs and dispatch timestamps:
 
@@ -604,13 +634,15 @@ Before using this design in a real plant or enterprise environment:
 
 ## Known boundaries
 
-- OPC UA and MQTT Sparkplug B are stated integration boundaries only; no protocol client, store-and-forward bridge, historian adapter, or vendor certificates are bundled. `source_event_id` enables deduplication at the normalized HTTP ingest boundary.
-- The CMMS outbox worker posts to `CMMS_API_URL` and expects a JSON response with `id` or `work_order_id`; bearer auth, retries, and an idempotency header are implemented, but vendor-specific contracts/status synchronization still require validation.
-- pgvector storage is initialized and seeded, but the bundled hash vectorizer is only a lightweight demo representation, not semantic-quality RAG.
-- Document ingestion now supports text extraction and provenance metadata, but does not retain original binaries, OCR scanned PDFs, or reliably infer page numbers from DOCX. Chunking is heading/page-aware but uses word-count windows; the embedding remains hash-based. Citation references are validated against retrieved chunk IDs and can open the stored passage, but claim-level citation entailment is not implemented.
-- Retrieval ranking is still based on deterministic hash vectors; the baseline evaluation fixture measures Recall@K/MRR but does not certify relevance. There is no hybrid keyword/vector search or reranker yet.
-- Knowledge retrieval enforces document role ACLs and optional plant query scope, but plant scope is not authorization until identity-to-plant entitlements are configured. Role ACLs are a single allowed-role list, not group, user, or document-owner policies.
+- The generic MQTT and OPC UA gateway, normalized HTTP ingest, and timestamp-ordered historian backfill are implemented. Site tag maps, OPC UA certificates, MQTT broker policy, store-and-forward behavior, and actual device commissioning remain deployment-specific.
+- The CMMS outbox worker posts to `CMMS_API_URL` and expects a JSON response with `id` or `work_order_id`; bearer auth, retries, idempotency, and mapped status polling are implemented, but vendor-specific contracts still require validation.
+- pgvector uses configurable 384-dimensional FastEmbed vectors with a local CPU model; model quality and latency still require evaluation on the target maintenance corpus.
+- Original uploads are retained in PostgreSQL and parsed asynchronously with OCR fallback; DOCX page numbers remain unavailable and chunking uses word-count windows. Claim-level checks use the configured Groq model to assess support and constrain citations to retrieved chunk IDs; this is advisory, not a formal entailment guarantee, and returns unavailable when no verifier is configured.
+- Retrieval combines vector and PostgreSQL full-text candidates with reciprocal-rank fusion. Optional cross-encoder reranking is available; keep it disabled until a reviewed technician query set shows measured gains. The bundled fixture is only a smoke test, not a quality certification.
+- Knowledge retrieval enforces OIDC role, subject, group, and plant ACLs. These remain claim-based application rules and require provider claim mapping and deployment validation.
 - Groq diagnosis is optional and advisory. The no-key path uses simple vibration/temperature thresholds, not a trained predictive-maintenance model.
 - Simulator and thresholds are for demonstration. There are no certification claims, functional safety claims, or direct machinery control paths.
-- Persistent threshold condition alerts and operator acknowledgement are implemented. Alert snooze, automatic investigation creation, email/Teams delivery deduplication beyond the destination's idempotency support, reporting-period filters, weekly pilot trend reporting, and a labeled-data evaluation harness are not implemented. SLA notifications are approval-focused; they do not provide technician scheduling or escalation policies.
-- Off-host audit hash verification, OPC UA/MQTT clients, historian connectors, a trained healthy-baseline detector, autonomous diagnosis/dispatch, semantic embeddings, claim-level citation entailment, drift monitoring, OpenTelemetry traces, PDF audit packs, and vendor CMMS adapters/status sync are not included. Browser OIDC is implemented but still requires provider-specific configuration and deployment validation. Metrics, role enforcement, migrations, and hash-linked events are foundations, not certification or full production observability.
+- Persistent condition alerts, operator acknowledgement, and auditable snooze are implemented. Alert snooze does not suppress or clear the underlying condition. SLA notifications remain approval-focused; technician scheduling and escalation policies are not included.
+- The healthy-baseline detector and holdout harness use synthetic simulator labels only. Train/evaluate against validated site labels before operational use; the detector is not a certified predictive-maintenance model. Close-out retrieval only indexes confirmed, non-simulated work orders.
+- PDF audit packs include workflow references and hash-linked events but are not digitally signed or an off-host verification archive. OpenTelemetry traces are opt-in and require a configured collector endpoint.
+- Plant-scoped APIs enforce UUID-array OIDC entitlements. Browser OIDC and claim names still require provider-specific configuration and deployment validation. Metrics, role enforcement, migrations, and hash-linked events are foundations, not certification or complete production observability.

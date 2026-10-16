@@ -1,5 +1,7 @@
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -8,6 +10,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import jwt
+from pypdf import PdfReader
+from sqlalchemy import column
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
@@ -19,6 +23,7 @@ from core import security
 from core.security import Principal
 from models import Asset
 from core.config import settings
+from core.observability import instrument_fastapi
 from main import _rate_limit_buckets, app
 from agents.workflow_graph import diagnose_node, dispatch_node
 from routers.workflow import OPEN_INVESTIGATION_STATUSES
@@ -28,6 +33,11 @@ from services import cmms_service
 from services import outbox_worker
 from services.notification_worker import build_webhook_payload
 from services.simulator_scenarios import build_scenario_reading
+from services.baseline_detector import train_and_evaluate
+from services.edge_gateway import normalize_gateway_reading
+from services.citation_verification import CitationCheck, validate_citation_checks
+from services.audit_pack import build_work_order_audit_pack
+from scripts.backfill_telemetry import load_historian_readings
 from schemas.simulator import ScenarioName, ScenarioStart
 from services.chat_service import READ_TOOL_NAMES
 from services.telemetry_ingest import acknowledge_asset_alert, update_asset_condition
@@ -164,6 +174,8 @@ class OIDCIdentityTests(IsolatedAsyncioTestCase):
             "oidc_audience": security.settings.oidc_audience,
             "oidc_jwks_url": security.settings.oidc_jwks_url,
             "oidc_roles_claim": security.settings.oidc_roles_claim,
+            "oidc_plants_claim": security.settings.oidc_plants_claim,
+            "oidc_groups_claim": security.settings.oidc_groups_claim,
             "api_key": security.settings.api_key,
         }
         issuer = "https://identity.example.test/tenant"
@@ -171,7 +183,10 @@ class OIDCIdentityTests(IsolatedAsyncioTestCase):
         security.settings.oidc_audience = "fieldnote-api"
         security.settings.oidc_jwks_url = f"{issuer}/keys"
         security.settings.oidc_roles_claim = "realm.roles"
+        security.settings.oidc_plants_claim = "plant_ids"
+        security.settings.oidc_groups_claim = "groups"
         security.settings.api_key = None
+        plant_id = uuid.uuid4()
         private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         token = jwt.encode(
             {
@@ -180,6 +195,8 @@ class OIDCIdentityTests(IsolatedAsyncioTestCase):
                 "aud": "fieldnote-api",
                 "exp": datetime.now(timezone.utc) + timedelta(minutes=3),
                 "realm": {"roles": ["operator", "approver"]},
+                "plant_ids": [str(plant_id)],
+                "groups": ["reliability-team"],
             },
             private_key,
             algorithm="RS256",
@@ -195,7 +212,54 @@ class OIDCIdentityTests(IsolatedAsyncioTestCase):
                 )
             self.assertEqual(principal.subject, "operator-17")
             self.assertEqual(principal.roles, frozenset({"operator", "approver"}))
+            self.assertEqual(principal.plant_ids, frozenset({plant_id}))
+            self.assertEqual(principal.groups, frozenset({"reliability-team"}))
             self.assertTrue(principal.verified)
+        finally:
+            for name, value in configured.items():
+                setattr(security.settings, name, value)
+
+    async def test_missing_plant_entitlements_fail_closed(self) -> None:
+        configured = {
+            "oidc_issuer": security.settings.oidc_issuer,
+            "oidc_audience": security.settings.oidc_audience,
+            "oidc_jwks_url": security.settings.oidc_jwks_url,
+            "oidc_roles_claim": security.settings.oidc_roles_claim,
+            "oidc_plants_claim": security.settings.oidc_plants_claim,
+            "api_key": security.settings.api_key,
+        }
+        issuer = "https://identity.example.test/tenant"
+        security.settings.oidc_issuer = issuer
+        security.settings.oidc_audience = "fieldnote-api"
+        security.settings.oidc_jwks_url = f"{issuer}/keys"
+        security.settings.oidc_roles_claim = "roles"
+        security.settings.oidc_plants_claim = "plant_ids"
+        security.settings.api_key = None
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        token = jwt.encode(
+            {
+                "sub": "operator-17",
+                "iss": issuer,
+                "aud": "fieldnote-api",
+                "exp": datetime.now(timezone.utc) + timedelta(minutes=3),
+                "roles": ["operator"],
+            },
+            private_key,
+            algorithm="RS256",
+            headers={"kid": "test-key"},
+        )
+        jwks = Mock()
+        jwks.get_signing_key_from_jwt.return_value = SimpleNamespace(key=private_key.public_key())
+        try:
+            with patch.object(security, "_jwks_client", return_value=jwks):
+                principal = await security.get_current_principal(
+                    credentials=HTTPAuthorizationCredentials(scheme="Bearer", credentials=token),
+                    x_api_key=None,
+                )
+            self.assertEqual(principal.plant_ids, frozenset())
+            with self.assertRaises(HTTPException) as raised:
+                security.plant_scope_filter(principal, object())
+            self.assertEqual(raised.exception.status_code, 403)
         finally:
             for name, value in configured.items():
                 setattr(security.settings, name, value)
@@ -208,6 +272,15 @@ class OIDCIdentityTests(IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as raised:
             security.reject_self_approval("operator-17", operator)
         self.assertEqual(raised.exception.status_code, 409)
+
+    async def test_plant_scope_filter_rejects_unentitled_plant(self) -> None:
+        allowed_plant = uuid.uuid4()
+        principal = Principal("operator-17", frozenset({"operator"}), True, "oidc", frozenset({allowed_plant}))
+        scope = security.plant_scope_filter(principal, column("plant_id"))
+        self.assertIn("IN", str(scope))
+        with self.assertRaises(HTTPException) as raised:
+            security.plant_scope_filter(principal, column("plant_id"), uuid.uuid4())
+        self.assertEqual(raised.exception.status_code, 403)
 
 
 class TelemetryContractTests(TestCase):
@@ -271,6 +344,124 @@ class SimulatorScenarioTests(TestCase):
         self.assertIsNone(build_scenario_reading(self.asset, "data_dropout", 0.5, 0, 3))
         with self.assertRaises(ValidationError):
             build_scenario_reading(self.asset, "invalid_reading", 0.9, 0, 3)
+
+    def test_baseline_detector_reports_labeled_simulator_holdout_metrics(self) -> None:
+        model, metrics = train_and_evaluate(samples_per_scenario=20)
+
+        self.assertEqual(model.classes_.tolist(), [0, 1])
+        self.assertEqual(metrics["evaluation_source"], "synthetic_simulator_scenarios")
+        self.assertEqual(metrics["scenario_counts"], {name: 20 for name in ("healthy_baseline", "vibration_rise", "overheating", "sudden_spike")})
+        self.assertGreaterEqual(metrics["recall"], 0.0)
+        self.assertLessEqual(metrics["recall"], 1.0)
+
+
+class EdgeGatewayTests(TestCase):
+    def setUp(self) -> None:
+        self.asset_id = uuid.uuid4()
+        self.base_reading = {
+            "asset_id": str(self.asset_id),
+            "timestamp": "2026-10-15T10:00:00+00:00",
+            "vibration_mm_s": 1.2,
+            "temperature_c": 20,
+            "pressure_bar": 3.4,
+            "rpm": 1450,
+        }
+
+    def test_gateway_reading_has_stable_idempotency_key_and_source(self) -> None:
+        first = normalize_gateway_reading(self.base_reading, source="mqtt")
+        second = normalize_gateway_reading(self.base_reading, source="mqtt")
+        self.assertEqual(first.source, "mqtt")
+        self.assertEqual(first.source_event_id, second.source_event_id)
+        opcua_first = normalize_gateway_reading(self.base_reading, source="opcua")
+        opcua_retry = normalize_gateway_reading(self.base_reading, source="opcua")
+        self.assertEqual(opcua_first.source_event_id, opcua_retry.source_event_id)
+
+    def test_historian_backfill_requires_timestamps_and_sorts_per_asset(self) -> None:
+        with TemporaryDirectory() as directory:
+            source_path = Path(directory) / "history.json"
+            source_path.write_text(json.dumps([
+                {**self.base_reading, "timestamp": "2026-10-15T10:05:00+00:00"},
+                {**self.base_reading, "timestamp": "2026-10-15T10:00:00+00:00"},
+            ]), encoding="utf-8")
+            readings = load_historian_readings(source_path)
+        self.assertEqual([item.timestamp.minute for item in readings], [0, 5])
+        self.assertTrue(all(item.source == "historian" for item in readings))
+
+
+class CMMSStatusMappingTests(TestCase):
+    def test_external_status_maps_to_monotonic_work_order_states(self) -> None:
+        self.assertEqual(cmms_service.map_cmms_status(" IN_PROGRESS "), "in_progress")
+        self.assertEqual(cmms_service.map_cmms_status("closed"), "completed")
+        self.assertIsNone(cmms_service.map_cmms_status("vendor_custom_state"))
+
+    def test_cmms_status_configuration_requires_safe_transitions(self) -> None:
+        with self.assertRaises(ValidationError):
+            Settings(cmms_status_url="https://cmms.example/api/status")
+        with self.assertRaises(ValidationError):
+            Settings(cmms_status_map={"done": "closed"})
+
+
+class ObservabilityTests(TestCase):
+    def test_tracing_is_disabled_without_an_otlp_endpoint(self) -> None:
+        original_endpoint = settings.otel_exporter_otlp_endpoint
+        settings.otel_exporter_otlp_endpoint = None
+        try:
+            self.assertFalse(instrument_fastapi(app))
+        finally:
+            settings.otel_exporter_otlp_endpoint = original_endpoint
+
+
+class AuditPackTests(TestCase):
+    def test_audit_pack_is_a_pdf_with_event_hash_chain(self) -> None:
+        work_order = SimpleNamespace(
+            id=uuid.uuid4(), status="dispatched", summary="Pump vibration alert",
+            diagnosis="Possible imbalance", recommendation="Inspect coupling",
+            cmms_reference="WO-123", workflow_state={"evidence_sources": [{"chunk_id": "chunk-1"}]},
+        )
+        event = SimpleNamespace(
+            created_at=datetime.now(timezone.utc), event_type="assessment_completed",
+            actor_id="operator-1", actor_type="oidc_user", from_status="processing",
+            to_status="awaiting_approval", details={"evidence_status": "available"},
+            event_hash="event-hash", previous_hash="previous-hash",
+        )
+
+        pdf = build_work_order_audit_pack(work_order, [event])
+
+        self.assertTrue(pdf.startswith(b"%PDF-"))
+        extracted = PdfReader(BytesIO(pdf)).pages[0].extract_text()
+        self.assertIn("event-hash", extracted)
+
+
+class CitationVerificationTests(TestCase):
+    def test_claim_support_requires_a_retrieved_chunk_id(self) -> None:
+        claims = ["Inspect bearing wear."]
+        status, checks = validate_citation_checks(
+            claims,
+            [CitationCheck(claim=claims[0], verdict="supported", chunk_ids=["invented-chunk"])],
+            {"retrieved-chunk"},
+        )
+        self.assertEqual(status, "issues")
+        self.assertEqual(checks[0]["verdict"], "unsupported")
+        self.assertEqual(checks[0]["chunk_ids"], [])
+
+    def test_supported_claim_keeps_only_verified_retrieved_citations(self) -> None:
+        claims = ["Inspect bearing wear."]
+        status, checks = validate_citation_checks(
+            claims,
+            [CitationCheck(claim=claims[0], verdict="supported", chunk_ids=["chunk-1", "invented-chunk"])],
+            {"chunk-1"},
+        )
+        self.assertEqual(status, "model_supported")
+        self.assertEqual(checks[0]["chunk_ids"], ["chunk-1"])
+
+    def test_verifier_results_must_match_the_claim_text(self) -> None:
+        status, checks = validate_citation_checks(
+            ["Inspect bearing wear."],
+            [CitationCheck(claim="Inspect pump cooling.", verdict="supported", chunk_ids=["chunk-1"])],
+            {"chunk-1"},
+        )
+        self.assertEqual(status, "invalid")
+        self.assertEqual(checks, [])
 
 
 class ChatContractTests(TestCase):

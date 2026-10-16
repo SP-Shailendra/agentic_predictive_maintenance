@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import PurePath
 import re
+import logging
 from zipfile import BadZipFile, ZipFile
 
 from docx import Document
@@ -9,10 +10,13 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 from pypdf import PdfReader
 
+from core.config import settings
+
 
 MAX_DOCX_EXPANDED_BYTES = 50 * 1024 * 1024
 MAX_DOCX_ARCHIVE_ENTRIES = 5000
 MAX_EXTRACTED_TEXT_CHARS = 5_000_000
+logger = logging.getLogger(__name__)
 
 
 class DocumentLoadError(ValueError):
@@ -97,7 +101,10 @@ def _load_pdf(raw: bytes) -> list[DocumentSegment]:
             raise DocumentLoadError("encrypted_pdf", "Encrypted PDFs are not supported.")
         segments = []
         for page_number, page in enumerate(reader.pages, start=1):
-            segment = _normalized_segment(page.extract_text() or "", page_number=page_number)
+            page_text = page.extract_text() or ""
+            if not page_text.strip() and settings.knowledge_ocr_enabled:
+                page_text = _ocr_pdf_page(raw, page_number)
+            segment = _normalized_segment(page_text, page_number=page_number)
             if segment:
                 segments.append(segment)
         return segments
@@ -105,6 +112,22 @@ def _load_pdf(raw: bytes) -> list[DocumentSegment]:
         raise
     except Exception as error:
         raise DocumentLoadError("invalid_pdf", "Uploaded file could not be parsed as a PDF.") from error
+
+
+def _ocr_pdf_page(raw: bytes, page_number: int) -> str:
+    try:
+        import fitz
+        import pytesseract
+        from PIL import Image
+
+        with fitz.open(stream=raw, filetype="pdf") as document:
+            page = document[page_number - 1]
+            pixmap = page.get_pixmap(dpi=200, alpha=False)
+            image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+            return pytesseract.image_to_string(image)
+    except (ImportError, OSError, RuntimeError) as error:
+        logger.warning("PDF OCR unavailable for page %s (%s)", page_number, type(error).__name__)
+        raise DocumentLoadError("ocr_unavailable", "Scanned PDF OCR is not available on this worker.") from error
 
 
 def load_document(filename: str, raw: bytes) -> list[DocumentSegment]:

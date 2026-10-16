@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 
 from core.config import settings
 from core.database import get_db
-from core.security import Principal, require_api_key, require_roles, WORKFLOW_READ_ROLES
+from core.security import Principal, plant_scope_filter, require_api_key, require_roles, WORKFLOW_READ_ROLES
 from models import Asset, SensorData
 from schemas.asset import TelemetryBatch, TelemetryIngest
 from services.telemetry_ingest import add_validated_reading, update_asset_condition
@@ -35,7 +35,11 @@ async def latest_telemetry(
     db: AsyncSession = Depends(get_db),
     _principal: Principal = Depends(require_roles(*WORKFLOW_READ_ROLES)),
 ) -> list[dict[str, Any]]:
-    rows = await db.scalars(select(SensorData).order_by(SensorData.timestamp.desc()).limit(60))
+    query = select(SensorData).join(Asset, Asset.id == SensorData.asset_id)
+    plant_filter = plant_scope_filter(_principal, Asset.plant_id)
+    if plant_filter is not None:
+        query = query.where(plant_filter)
+    rows = await db.scalars(query.order_by(SensorData.timestamp.desc()).limit(60))
     return [_reading(row) for row in rows.all()]
 
 
@@ -46,7 +50,11 @@ async def asset_telemetry(
     db: AsyncSession = Depends(get_db),
     _principal: Principal = Depends(require_roles(*WORKFLOW_READ_ROLES)),
 ) -> list[dict[str, Any]]:
-    asset = await db.scalar(select(Asset.id).where(Asset.id == asset_id))
+    asset_query = select(Asset.id).where(Asset.id == asset_id)
+    plant_filter = plant_scope_filter(_principal, Asset.plant_id)
+    if plant_filter is not None:
+        asset_query = asset_query.where(plant_filter)
+    asset = await db.scalar(asset_query)
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found")
     rows = await db.scalars(
@@ -61,7 +69,11 @@ async def ingest_telemetry(
     db: AsyncSession = Depends(get_db),
     _principal: Principal = Depends(require_roles("operator", "reliability_engineer", allow_service=True)),
 ) -> dict[str, str]:
-    asset = await db.scalar(select(Asset).where(Asset.id == payload.asset_id).with_for_update())
+    asset_query = select(Asset).where(Asset.id == payload.asset_id)
+    plant_filter = plant_scope_filter(_principal, Asset.plant_id)
+    if plant_filter is not None:
+        asset_query = asset_query.where(plant_filter)
+    asset = await db.scalar(asset_query.with_for_update())
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found")
     result = await add_validated_reading(payload, db, asset)
@@ -93,7 +105,11 @@ async def ingest_telemetry_batch(
     _principal: Principal = Depends(require_roles("operator", "reliability_engineer", allow_service=True)),
 ) -> dict[str, int | str]:
     asset_ids = {reading.asset_id for reading in payload.readings}
-    assets = await db.scalars(select(Asset).where(Asset.id.in_(asset_ids)).order_by(Asset.id).with_for_update())
+    asset_query = select(Asset).where(Asset.id.in_(asset_ids))
+    plant_filter = plant_scope_filter(_principal, Asset.plant_id)
+    if plant_filter is not None:
+        asset_query = asset_query.where(plant_filter)
+    assets = await db.scalars(asset_query.order_by(Asset.id).with_for_update())
     assets_by_id = {asset.id: asset for asset in assets.all()}
     missing = asset_ids - assets_by_id.keys()
     if missing:

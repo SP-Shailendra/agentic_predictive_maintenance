@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FIELDNOTE_SECRETS_DIR=/run/secrets
 WORKDIR /app
 RUN groupadd --system app && useradd --system --gid app --create-home app
+RUN apt-get update && apt-get install -y --no-install-recommends tesseract-ocr && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /run/secrets && chown app:app /run/secrets
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

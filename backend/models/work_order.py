@@ -22,6 +22,8 @@ class WorkOrder(Base):
     recommendation: Mapped[str | None] = mapped_column(Text)
     workflow_state: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     cmms_reference: Mapped[str | None] = mapped_column(String(120))
+    cmms_external_status: Mapped[str | None] = mapped_column(String(80))
+    cmms_status_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     assigned_to_sub: Mapped[str | None] = mapped_column(String(255), index=True)
     created_by_sub: Mapped[str | None] = mapped_column(String(255))
     approved_by_sub: Mapped[str | None] = mapped_column(String(255))

@@ -1,4 +1,4 @@
-import { AlertTriangle, Ban, Check, CheckCircle2, ClipboardCheck, LoaderCircle, ShieldCheck, TriangleAlert, Wrench, X } from 'lucide-react'
+import { AlertTriangle, Ban, Check, CheckCircle2, ClipboardCheck, Download, LoaderCircle, ShieldCheck, TriangleAlert, Wrench, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import StatusPill from './StatusPill.jsx'
 import AgentTerminalLog from './AgentTerminalLog.jsx'
@@ -160,6 +160,7 @@ export default function ApprovalModal({ workflow, auditEvents = [], activity = [
       <section className="approval-modal" role="dialog" aria-modal="true" aria-labelledby="approval-title" tabIndex={-1} ref={dialogRef}>
         <div className="modal-topline">
           <span><ClipboardCheck size={15} /> WORK ORDER REVIEW · <span className="mono">{workflow.id}</span> · {new Date(workflow.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+          <button className="icon-button modal-close" type="button" onClick={() => api.workOrderAuditPack(workflow.id).catch((error) => setDecisionError(error.message || 'Audit pack download failed.'))} aria-label="Download work order audit pack" title="Download PDF audit pack"><Download size={17} /></button>
           <button className="icon-button modal-close" type="button" onClick={onClose} aria-label="Close review" title="Close review"><X size={18} /></button>
         </div>
         <div className="review-tabs" role="tablist" aria-label="Work order detail views">
@@ -190,6 +191,9 @@ export default function ApprovalModal({ workflow, auditEvents = [], activity = [
               )}
               {state.evidence_status === 'unavailable' && <div className="confidence-note evidence-unavailable"><TriangleAlert size={15} /><span>Knowledge evidence unavailable. This assessment was completed without retrieved maintenance references.</span></div>}
               {state.evidence_status === 'no_matches' && <div className="review-section"><label>MAINTENANCE REFERENCES</label><p>The knowledge search completed, but found no matching references.</p></div>}
+              {state.citation_verification_status === 'model_supported' && <div className="review-section"><label>CLAIM-LEVEL CITATION CHECK</label><p>The configured verifier found support for each diagnosis and recommendation claim in the cited passages. This model check is advisory, not a guarantee.</p></div>}
+              {state.citation_verification_status === 'issues' && <div className="confidence-note evidence-unavailable"><TriangleAlert size={15} /><span>One or more diagnosis or recommendation claims were unsupported or uncertain against retrieved evidence. Review the cited passages before approval.</span></div>}
+              {state.citation_verification_status === 'unavailable' && state.evidence_sources?.length > 0 && <div className="confidence-note evidence-unavailable"><TriangleAlert size={15} /><span>Claim-level citation support was not verified. Treat recommendations as unverified and review the cited passages.</span></div>}
               {state.evidence_sources?.length > 0 ? <div className="review-section citation-list"><label>RETRIEVED SOURCE PASSAGES</label>{state.evidence_sources.map((citation, index) => <button className="citation-reference" type="button" key={citation.chunk_id} aria-expanded={sourceDetail?.chunk_id === citation.chunk_id} onClick={() => openCitation(citation)}><strong>REFERENCE {String(index + 1).padStart(2, '0')} · {citation.filename || 'Maintenance source'}</strong><span>{[citation.revision && `Revision ${citation.revision}`, citation.page_number && `Page ${citation.page_number}`, citation.section_title].filter(Boolean).join(' · ') || 'Open retrieved passage'}</span></button>)}</div> : state.evidence?.length > 0 && <div className="review-section"><label>LEGACY REFERENCE NOTES</label>{state.evidence.map((note, index) => <p key={`${index}-${note}`}>{note}</p>)}</div>}
               {sourceLoading && <p className="citation-source-status" role="status">Loading source passage…</p>}
               {sourceError && <p className="citation-source-status is-error" role="alert">{sourceError}</p>}

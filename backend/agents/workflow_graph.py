@@ -35,6 +35,8 @@ async def diagnose_node(state: WorkflowState) -> dict[str, Any]:
             evidence_sources=state.get("evidence_sources", []),
             evidence_status=state.get("evidence_status", "legacy"),
             evidence_error_code=state.get("evidence_error_code"),
+            citation_verification_status=state.get("citation_verification_status", "unavailable"),
+            citation_checks=state.get("citation_checks", []),
             method=state.get("diagnostic_method", "threshold_fallback"),
             model_version=state.get("diagnostic_model_version", "threshold-fallback-v1"),
         )
@@ -51,6 +53,8 @@ async def diagnose_node(state: WorkflowState) -> dict[str, Any]:
         "evidence_sources": result.evidence_sources,
         "evidence_status": result.evidence_status,
         "evidence_error_code": result.evidence_error_code,
+        "citation_verification_status": result.citation_verification_status,
+        "citation_checks": result.citation_checks,
         "diagnostic_method": result.method,
         "diagnostic_model_version": result.model_version,
         "activity": _activity(state, "Diagnose", log_message),

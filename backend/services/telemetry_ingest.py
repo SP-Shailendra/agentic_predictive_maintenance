@@ -27,6 +27,8 @@ def update_asset_condition(asset: Asset, vibration: float, temperature: float, t
             asset.alert_started_at = timestamp
             asset.alert_acknowledged_at = None
             asset.alert_acknowledged_by = None
+            asset.alert_snoozed_until = None
+            asset.alert_snoozed_by = None
         asset.alert_normal_readings = 0
     elif asset.alert_active:
         if previous_timestamp is None or (timestamp - previous_timestamp).total_seconds() > ALERT_RECOVERY_MAX_GAP_SECONDS:
@@ -34,6 +36,8 @@ def update_asset_condition(asset: Asset, vibration: float, temperature: float, t
         asset.alert_normal_readings = min(ALERT_RECOVERY_READINGS, (asset.alert_normal_readings or 0) + 1)
         if asset.alert_acknowledged_at is not None and asset.alert_normal_readings >= ALERT_RECOVERY_READINGS:
             asset.alert_active = False
+            asset.alert_snoozed_until = None
+            asset.alert_snoozed_by = None
 
 
 def acknowledge_asset_alert(asset: Asset, subject: str, now: datetime) -> None:
@@ -48,6 +52,8 @@ def acknowledge_asset_alert(asset: Asset, subject: str, now: datetime) -> None:
         and 0 <= (now - last_reading).total_seconds() <= ALERT_RECOVERY_MAX_GAP_SECONDS
     ):
         asset.alert_active = False
+        asset.alert_snoozed_until = None
+        asset.alert_snoozed_by = None
 
 
 async def add_validated_reading(payload: TelemetryIngest, db: AsyncSession, asset: Asset) -> dict[str, str]:

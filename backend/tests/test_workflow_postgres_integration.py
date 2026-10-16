@@ -18,10 +18,12 @@ from core.database import Base, get_db
 from core.migrations import upgrade_database
 from core.security import Principal, get_current_principal
 from main import app
-from models import Asset, AssetThresholdChange, CMMSOutbox, KnowledgeDocument, NotificationOutbox, Plant, SensorData, SimulatorScenarioEvent, WorkOrder, WorkflowEvent
+from models import Asset, AssetThresholdChange, CMMSOutbox, KnowledgeDocument, KnowledgeDocumentFile, NotificationOutbox, Plant, SensorData, SimulatorScenarioEvent, WorkOrder, WorkflowEvent
 from services import approval_sla_worker, notification_worker
 from services import outbox_worker
 from services import ingestion_service, rag_service
+from services.closeout_knowledge import enqueue_closed_work_order_knowledge
+from scripts.index_closed_work_orders import index_closed_work_orders
 from services.document_loader import DocumentLoadError, DocumentSegment
 from services.rag_evaluation import score_retrieval_suite
 from services.workflow_notifications import enqueue_workflow_notification
@@ -76,6 +78,7 @@ class WorkflowPostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 session.add(asset)
                 await session.flush()
+                self.plant_id = plant.id
                 self.asset_id = asset.id
 
     async def asyncTearDown(self) -> None:
@@ -234,7 +237,7 @@ class WorkflowPostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
         async with self.engine.begin() as connection:
             for case in cases:
                 phrase = case["relevant_phrases"][0]
-                embedding = rag_service._hash_embedding(phrase)
+                embedding = [0.0] * 384
                 vector_literal = "[" + ",".join(str(value) for value in embedding) + "]"
                 await connection.execute(
                     text("INSERT INTO knowledge_chunks (id, content, embedding) VALUES (:id, :content, CAST(:embedding AS vector))"),
@@ -252,6 +255,48 @@ class WorkflowPostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(metrics["mean_mrr_at_k"], 0.0)
         self.assertLessEqual(metrics["mean_mrr_at_k"], 1.0)
 
+    async def test_plant_entitlements_restrict_asset_and_plant_queries(self) -> None:
+        async with self.sessions() as session:
+            async with session.begin():
+                other_plant = Plant(
+                    code=f"IT-{uuid.uuid4().hex[:8]}",
+                    name="Other integration plant",
+                    location="Other location",
+                    region="Test",
+                )
+                session.add(other_plant)
+                await session.flush()
+                other_asset = Asset(
+                    plant_id=other_plant.id,
+                    name="Other integration asset",
+                    asset_tag=f"IT-{uuid.uuid4().hex[:8]}",
+                    asset_type="Test pump",
+                    location="Other bay",
+                    status="operational",
+                    criticality="medium",
+                )
+                session.add(other_asset)
+                await session.flush()
+                other_plant_id = other_plant.id
+                other_asset_id = other_asset.id
+
+        self.principal = Principal(
+            subject="plant-scoped-operator",
+            roles=frozenset({"operator"}),
+            verified=True,
+            auth_method="oidc",
+            plant_ids=frozenset({self.plant_id}),
+        )
+        assets = await self.client.get("/api/assets")
+        self.assertEqual(assets.status_code, 200)
+        self.assertEqual({item["id"] for item in assets.json()}, {str(self.asset_id)})
+        denied_plant = await self.client.get(f"/api/assets?plant_id={other_plant_id}")
+        self.assertEqual(denied_plant.status_code, 403)
+        hidden_asset = await self.client.get(f"/api/assets/{other_asset_id}")
+        self.assertEqual(hidden_asset.status_code, 404)
+        plants = await self.client.get("/api/plants")
+        self.assertEqual({item["id"] for item in plants.json()}, {str(self.plant_id)})
+
     async def test_knowledge_ingestion_persists_metadata_deduplicates_and_filters_acl(self) -> None:
         self.principal = Principal("test-reliability", frozenset({"reliability_engineer"}), True, "oidc")
         raw = ("# Bearing maintenance\n" + "Inspect bearing lubrication and coupling alignment before action. " * 110).encode()
@@ -268,14 +313,27 @@ class WorkflowPostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "revision": "A",
                 "plant_id": str(plant_id),
                 "allowed_roles": "technician",
+                "allowed_subjects": "test-technician",
+                "allowed_groups": "maintenance-team",
             },
         )
-        self.assertEqual(upload.status_code, 201, upload.text)
+        self.assertEqual(upload.status_code, 202, upload.text)
         document = upload.json()
-        self.assertEqual(document["ingestion_status"], "indexed")
-        self.assertGreaterEqual(document["chunk_count"], 1)
+        self.assertEqual(document["ingestion_status"], "processing")
+        self.assertEqual(document["chunk_count"], 0)
         self.assertEqual(document["allowed_roles"], ["technician"])
+        self.assertEqual(document["allowed_subjects"], ["test-technician"])
+        self.assertEqual(document["allowed_groups"], ["maintenance-team"])
         self.assertEqual(document["revision"], "A")
+        async with self.sessions() as session:
+            original = await session.get(KnowledgeDocumentFile, uuid.UUID(document["id"]))
+            self.assertEqual(original.data, raw)
+            with patch.object(ingestion_service, "embed_texts", side_effect=lambda contents: [[0.0] * 384 for _ in contents]):
+                await ingestion_service.process_document(session, uuid.UUID(document["id"]))
+            indexed_document = await session.get(KnowledgeDocument, uuid.UUID(document["id"]))
+            self.assertEqual(indexed_document.ingestion_status, "indexed")
+            self.assertGreaterEqual(indexed_document.chunk_count, 1)
+            document["chunk_count"] = indexed_document.chunk_count
 
         duplicate = await self.client.post(
             "/api/knowledge/documents",
@@ -287,7 +345,7 @@ class WorkflowPostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.principal = Principal("test-manager", frozenset({"manager"}), True, "oidc")
         manager_documents = await self.client.get("/api/knowledge/documents")
         hidden_document = await self.client.get(f"/api/knowledge/documents/{document['id']}")
-        self.assertEqual(manager_documents.json(), [])
+        self.assertFalse(any(item["id"] == document["id"] for item in manager_documents.json()))
         self.assertEqual(hidden_document.status_code, 404)
 
         self.principal = Principal("test-technician", frozenset({"technician"}), True, "oidc")
@@ -295,21 +353,36 @@ class WorkflowPostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
         wrong_plant_document = await self.client.get(f"/api/knowledge/documents/{document['id']}?plant_id={uuid.uuid4()}")
         self.assertEqual(visible_document.status_code, 200, visible_document.text)
         self.assertEqual(wrong_plant_document.status_code, 404)
+        self.principal = Principal("group-technician", frozenset({"technician"}), True, "oidc", groups=frozenset({"maintenance-team"}))
+        group_document = await self.client.get(f"/api/knowledge/documents/{document['id']}?plant_id={plant_id}")
+        self.assertEqual(group_document.status_code, 200, group_document.text)
+        self.principal = Principal("unlisted-technician", frozenset({"technician"}), True, "oidc")
+        unlisted_document = await self.client.get(f"/api/knowledge/documents/{document['id']}?plant_id={plant_id}")
+        self.assertEqual(unlisted_document.status_code, 404)
 
         with patch.object(rag_service, "engine", self.engine):
             technician_results = await rag_service.retrieve_documents(
-                "bearing lubrication", allowed_roles={"technician"}, plant_id=plant_id,
+                "bearing lubrication", allowed_roles={"technician"}, allowed_subject="test-technician", plant_id=plant_id,
             )
             manager_results = await rag_service.retrieve_documents(
                 "bearing lubrication", allowed_roles={"manager"}, plant_id=plant_id,
+            )
+            group_results = await rag_service.retrieve_documents(
+                "bearing lubrication", allowed_roles={"technician"}, allowed_groups={"maintenance-team"}, plant_id=plant_id,
+            )
+            unlisted_results = await rag_service.retrieve_documents(
+                "bearing lubrication", allowed_roles={"technician"}, allowed_subject="unlisted-technician", plant_id=plant_id,
             )
             other_plant_results = await rag_service.retrieve_documents(
                 "bearing lubrication", allowed_roles={"technician"}, plant_id=uuid.uuid4(),
             )
         self.assertTrue(any(row["document_id"] == document["id"] for row in technician_results))
         self.assertFalse(any(row.get("document_id") == document["id"] for row in manager_results))
+        self.assertTrue(any(row.get("document_id") == document["id"] for row in group_results))
+        self.assertFalse(any(row.get("document_id") == document["id"] for row in unlisted_results))
         self.assertFalse(any(row.get("document_id") == document["id"] for row in other_plant_results))
         source_chunk = next(row for row in technician_results if row["document_id"] == document["id"])
+        self.principal = Principal("test-technician", frozenset({"technician"}), True, "oidc")
         passage = await self.client.get(f"/api/knowledge/chunks/{source_chunk['chunk_id']}?plant_id={plant_id}")
         self.assertEqual(passage.status_code, 200, passage.text)
         self.assertEqual(passage.json()["filename"], "pump-guide.md")
@@ -334,20 +407,103 @@ class WorkflowPostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "files": {"file": ("retry.txt", raw, "text/plain")},
             "data": {"document_type": "procedure", "allowed_roles": "operator"},
         }
-        with patch.object(ingestion_service, "load_document", side_effect=DocumentLoadError("extract_failed", "Safe failure.")):
-            failed = await self.client.post("/api/knowledge/documents", **payload)
-        self.assertEqual(failed.status_code, 422)
+        failed = await self.client.post("/api/knowledge/documents", **payload)
+        self.assertEqual(failed.status_code, 202)
         checksum = hashlib.sha256(raw).hexdigest()
         async with self.sessions() as session:
             failed_record = await session.scalar(select(KnowledgeDocument).where(KnowledgeDocument.sha256 == checksum))
-            self.assertEqual(failed_record.ingestion_status, "failed")
             failed_id = failed_record.id
+            with patch.object(ingestion_service, "load_document", side_effect=DocumentLoadError("extract_failed", "Safe failure.")):
+                with self.assertRaises(DocumentLoadError):
+                    await ingestion_service.process_document(session, failed_id)
+        async with self.sessions() as session:
+            failed_record = await session.get(KnowledgeDocument, failed_id)
+            self.assertEqual(failed_record.ingestion_status, "failed")
 
-        with patch.object(ingestion_service, "load_document", return_value=[DocumentSegment("Verified retry content")]):
-            retried = await self.client.post("/api/knowledge/documents", **payload)
-        self.assertEqual(retried.status_code, 201, retried.text)
+        retried = await self.client.post("/api/knowledge/documents", **payload)
+        self.assertEqual(retried.status_code, 202, retried.text)
         self.assertEqual(retried.json()["id"], str(failed_id))
-        self.assertEqual(retried.json()["ingestion_status"], "indexed")
+        async with self.sessions() as session:
+            with patch.object(ingestion_service, "load_document", return_value=[DocumentSegment("Verified retry content")]), \
+                 patch.object(ingestion_service, "embed_texts", side_effect=lambda contents: [[0.0] * 384 for _ in contents]):
+                await ingestion_service.process_document(session, failed_id)
+            retried_record = await session.get(KnowledgeDocument, failed_id)
+            self.assertEqual(retried_record.ingestion_status, "indexed")
+
+    async def test_closed_real_work_orders_are_indexed_but_simulated_orders_are_excluded(self) -> None:
+        async with self.sessions() as session:
+            real_order = WorkOrder(
+                asset_id=self.asset_id,
+                status="closed",
+                summary="Pump bearing inspection",
+                diagnosis="Bearing wear confirmed",
+                recommendation="Replace bearing and verify alignment",
+                confirmed_root_cause="bearing_wear",
+                closed_by_sub="reliability-1",
+                workflow_state={"simulated_only": False, "closeout_comment": "Confirmed during inspection."},
+            )
+            simulated_order = WorkOrder(
+                asset_id=self.asset_id,
+                status="closed",
+                summary="Simulated bearing inspection",
+                diagnosis="Synthetic result",
+                recommendation="Demo only",
+                confirmed_root_cause="bearing_wear",
+                cmms_reference="SIM-TEST",
+                workflow_state={"simulated_only": True},
+            )
+            session.add_all([real_order, simulated_order])
+            await session.flush()
+            real_document_id = await enqueue_closed_work_order_knowledge(session, real_order)
+            simulated_document_id = await enqueue_closed_work_order_knowledge(session, simulated_order)
+            await session.commit()
+            self.assertIsNotNone(real_document_id)
+            self.assertIsNone(simulated_document_id)
+            with patch.object(ingestion_service, "embed_texts", side_effect=lambda contents: [[0.0] * 384 for _ in contents]):
+                await ingestion_service.process_document(session, real_document_id)
+            document = await session.scalar(
+                select(KnowledgeDocument).where(KnowledgeDocument.source_work_order_id == real_order.id)
+            )
+            original = await session.get(KnowledgeDocumentFile, real_document_id)
+            self.assertEqual(document.ingestion_status, "indexed")
+            self.assertIn(b"Confirmed root cause: bearing_wear", original.data)
+
+    async def test_historical_closeout_backfill_excludes_simulated_orders_and_is_idempotent(self) -> None:
+        async with self.sessions() as session:
+            real_order = WorkOrder(
+                asset_id=self.asset_id,
+                status="closed",
+                summary="Historical real repair",
+                confirmed_root_cause="misalignment",
+                cmms_reference="WO-REAL-1",
+                workflow_state={"simulated_only": False},
+            )
+            simulated_order = WorkOrder(
+                asset_id=self.asset_id,
+                status="closed",
+                summary="Historical simulated repair",
+                confirmed_root_cause="misalignment",
+                cmms_reference="SIM-OLD-1",
+                workflow_state={"simulated_only": True},
+            )
+            session.add_all([real_order, simulated_order])
+            await session.commit()
+            real_id = real_order.id
+            simulated_id = simulated_order.id
+
+        first_count = await index_closed_work_orders(batch_size=10, session_factory=self.sessions)
+        second_count = await index_closed_work_orders(batch_size=10, session_factory=self.sessions)
+        self.assertEqual(first_count, 1)
+        self.assertEqual(second_count, 0)
+        async with self.sessions() as session:
+            real_document = await session.scalar(
+                select(KnowledgeDocument).where(KnowledgeDocument.source_work_order_id == real_id)
+            )
+            simulated_document = await session.scalar(
+                select(KnowledgeDocument).where(KnowledgeDocument.source_work_order_id == simulated_id)
+            )
+            self.assertIsNotNone(real_document)
+            self.assertIsNone(simulated_document)
 
     async def test_concurrent_workflow_starts_create_only_one_investigation(self) -> None:
         first_entered_graph = asyncio.Event()

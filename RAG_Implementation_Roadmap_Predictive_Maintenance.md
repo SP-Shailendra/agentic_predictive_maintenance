@@ -471,3 +471,20 @@ The first milestone is a working flow in which a real maintenance document is in
 - Retrieval outcomes are distinguished as `available`, `no_matches`, or `unavailable`. Failures are logged without query/chunk text and counted by outcome in `rag_retrieval_requests_total`.
 - Server-generated citation references are validated against retrieved chunk IDs and persist chunk/document IDs, revision, page, and section in work-order JSON plus the hash-chained `assessment_completed` event. The approval modal opens a passage through a role/plant-filtered API endpoint.
 - Remaining for this trust slice: claim-level citation entailment, real semantic embeddings, hybrid search/reranking, distributed rate limiting, and user-to-plant identity entitlements. PostgreSQL integration tests passed against a disposable database; the local application database is migrated through `20261009_0009`.
+
+## Semantic retrieval update (2026-10-16)
+
+- Replaced runtime hash vectors with FastEmbed using `BAAI/bge-small-en-v1.5` by default; document and query vectors are normalized and checked against the existing 384-dimensional pgvector column.
+- Added `embedding_model` provenance and an Alembic migration. Existing chunks remain available to keyword search until reindexed with `python -m scripts.reindex_knowledge_embeddings --confirm`.
+- Retrieval now combines model-matched vector candidates and PostgreSQL full-text candidates using reciprocal-rank fusion, preserving the existing document role and optional plant filters.
+- The evaluation script accepts a custom labeled query set through `--cases`; metrics still measure retrieval only and are not a production quality certification.
+- Focused RAG unit tests and full backend unit discovery passed. PostgreSQL integration tests were skipped because `TEST_DATABASE_URL` was not configured in the local environment.
+- Remaining gaps include cross-encoder reranking, claim-level citation entailment, and identity-backed plant entitlements.
+
+## RAG completion update (2026-10-16)
+
+- Document uploads now retain original bytes, return a queued processing record, and are parsed/indexed by a leased background worker with bounded retries. Image-only PDF pages use configurable Tesseract OCR; DOCX page attribution remains unavailable.
+- Knowledge ACLs now combine roles with optional verified OIDC subject/group claims and plant entitlements. `OIDC_GROUPS_CLAIM` defaults to `groups`.
+- Human-confirmed close-outs are indexed as plant-scoped knowledge only when not marked simulated and without a `SIM-` CMMS reference. `scripts/index_closed_work_orders.py --confirm` supports idempotent historical backfill.
+- The FastEmbed cross-encoder is optional via `RAG_RERANKER_MODEL_NAME`. Evaluation reports Recall@K, MRR, and nDCG, and `--compare-reranker` prints paired deltas. Leave it disabled until reviewed technician-query data demonstrates a gain.
+- Remaining: collect/approve real technician queries and relevance labels; replace/adjudicate the advisory LLM citation check with a validated entailment method if policy requires stronger guarantees; validate ACL claim mappings with the production identity provider. Do not use synthetic questions or labels as substitutes for field evaluation.

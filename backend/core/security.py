@@ -1,5 +1,6 @@
 import asyncio
 import secrets
+import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Annotated
@@ -22,6 +23,8 @@ class Principal:
     roles: frozenset[str]
     verified: bool
     auth_method: str
+    plant_ids: frozenset[uuid.UUID] | None = None
+    groups: frozenset[str] | None = None
 
 
 @lru_cache(maxsize=8)
@@ -46,6 +49,23 @@ def _role_set(value: object) -> frozenset[str]:
     else:
         roles = set()
     return frozenset(roles & KNOWN_ROLES)
+
+
+def _plant_id_set(value: object) -> frozenset[uuid.UUID]:
+    if not isinstance(value, list):
+        return frozenset()
+    try:
+        return frozenset(uuid.UUID(item) for item in value if isinstance(item, str))
+    except ValueError:
+        return frozenset()
+
+
+def _group_set(value: object) -> frozenset[str]:
+    if isinstance(value, str):
+        return frozenset(group.strip() for group in value.replace(",", " ").split() if group.strip())
+    if isinstance(value, list):
+        return frozenset(group.strip() for group in value if isinstance(group, str) and group.strip())
+    return frozenset()
 
 
 async def get_current_principal(
@@ -74,11 +94,20 @@ async def get_current_principal(
             ) from exc
         subject = claims.get("sub")
         roles = _role_set(_claim(claims, settings.oidc_roles_claim))
+        plant_ids = _plant_id_set(_claim(claims, settings.oidc_plants_claim))
+        groups = _group_set(_claim(claims, settings.oidc_groups_claim))
         if not isinstance(subject, str) or not subject:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bearer token has no subject.")
         if not roles:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="A recognized Fieldnote role is required.")
-        return Principal(subject=subject, roles=roles, verified=True, auth_method="oidc")
+        return Principal(
+            subject=subject,
+            roles=roles,
+            verified=True,
+            auth_method="oidc",
+            plant_ids=plant_ids,
+            groups=groups,
+        )
 
     if settings.api_key:
         if not secrets.compare_digest(x_api_key or "", settings.api_key):
@@ -120,6 +149,27 @@ def reject_self_approval(created_by_sub: str | None, principal: Principal) -> No
             status_code=status.HTTP_409_CONFLICT,
             detail="The person who raised this investigation cannot approve it.",
         )
+
+
+def plant_scope_filter(principal: Principal, column, requested_plant_id: uuid.UUID | None = None):
+    if principal.plant_ids is None:
+        return column == requested_plant_id if requested_plant_id is not None else None
+    if not principal.plant_ids:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No plant entitlements are assigned.")
+    if requested_plant_id is not None:
+        if requested_plant_id not in principal.plant_ids:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You are not entitled to this plant.")
+        return column == requested_plant_id
+    return column.in_(principal.plant_ids)
+
+
+def require_plant_assignment(principal: Principal, plant_id: uuid.UUID | None) -> None:
+    if principal.plant_ids is None:
+        return
+    if plant_id is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="A plant assignment is required.")
+    if plant_id not in principal.plant_ids:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You are not entitled to this plant.")
 
 
 async def require_api_key(

@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from math import log2
 from typing import Any
 
 
@@ -20,9 +21,18 @@ def score_retrieval_case(
         if (position := next((index for index, content in enumerate(ranked, start=1) if phrase.casefold() in content), None)) is not None
     ]
     first_rank = min(relevant_positions) if relevant_positions else None
+    relevant_set = {phrase.casefold() for phrase in relevant_phrases}
+    gains = [
+        1.0 if any(phrase in content for phrase in relevant_set) else 0.0
+        for content in ranked
+    ]
+    dcg = sum(gain / log2(rank + 1) for rank, gain in enumerate(gains, start=1))
+    ideal_relevant = min(len(relevant_set), k)
+    ideal_dcg = sum(1.0 / log2(rank + 1) for rank in range(1, ideal_relevant + 1))
     return {
         "recall_at_k": len(relevant_positions) / len(relevant_phrases),
         "mrr_at_k": 1 / first_rank if first_rank is not None else 0.0,
+        "ndcg_at_k": dcg / ideal_dcg if ideal_dcg else 0.0,
         "relevant_sources": len(relevant_positions),
         "expected_sources": len(relevant_phrases),
         "first_relevant_rank": first_rank or 0,
@@ -48,4 +58,5 @@ def score_retrieval_suite(
         "k": k,
         "mean_recall_at_k": sum(result["recall_at_k"] for result in results) / len(results),
         "mean_mrr_at_k": sum(result["mrr_at_k"] for result in results) / len(results),
+        "mean_ndcg_at_k": sum(result["ndcg_at_k"] for result in results) / len(results),
     }
