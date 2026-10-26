@@ -411,7 +411,6 @@ Values are loaded by Pydantic Settings from environment variables and `.env`. Th
 | `OIDC_ROLES_CLAIM` | `roles` | Dot-separated token claim path for recognized roles: `operator`, `reliability_engineer`, `approver`, `manager`, `technician`. |
 | `OIDC_PLANTS_CLAIM` | `plant_ids` | Dot-separated token claim path containing an array of entitled plant UUIDs. Missing/invalid membership fails closed for OIDC users. |
 | `OIDC_GROUPS_CLAIM` | `groups` | Dot-separated token claim path containing group identifiers used by knowledge document ACLs. |
-| `OIDC_GROUPS_CLAIM` | `groups` | Dot-separated token claim path containing document ACL group identifiers. |
 | `METRICS_API_KEY` | Empty | Required for `/metrics` outside development; send it as `X-Metrics-API-Key`. |
 | `CMMS_API_URL` | Empty | Optional HTTPS endpoint receiving an approved work-order JSON payload |
 | `CMMS_API_TOKEN` | Empty | Optional bearer token for the configured CMMS; required in production |
@@ -450,10 +449,11 @@ Values are loaded by Pydantic Settings from environment variables and `.env`. Th
 | `VITE_OIDC_CLIENT_ID` | Empty | Public browser client ID; never place a client secret in Vite variables |
 | `VITE_OIDC_REDIRECT_URI` | `http://localhost:4173/` | Registered browser sign-in and sign-out redirect URI |
 | `VITE_OIDC_ROLES_CLAIM` | `roles` | Dot-separated claim path used to show role-appropriate browser controls |
+| `VITE_AUTH_HELP_URL` | Empty | Optional HTTPS identity-provider help or IT-support URL shown as “Need access?” on the login page. |
 
 API routes accept a verified OIDC bearer token with subject and recognized role claims. The static `API_KEY` remains a service-client compatibility path and does not identify a person. The frontend does not embed service keys. Production startup requires OIDC issuer/audience/JWKS, HTTPS origins and CMMS URL, a CMMS token, a metrics key, simulator disabled, and a non-default database password. Secrets can be mounted as files under `/run/secrets` in the backend container (file names use the setting name, for example `oidc_issuer` or `cmms_api_token`); connect this to the deployment platform's secret store. Local development without OIDC uses an explicitly unverified local identity and must not be deployed as production authentication.
 
-The dashboard selector switches between the all-plants portfolio and an individual plant. Asset search, condition, and criticality filters apply within the selected scope; KPIs and pending approvals are scoped to the same plant. When both public `VITE_OIDC_AUTHORITY` and `VITE_OIDC_CLIENT_ID` are set, the browser uses OIDC Authorization Code + PKCE and sends access tokens as bearer credentials. With either value unset, local development keeps the explicitly unverified demo identity. Provider-specific client registration, redirect allowlists, role claims, and API issuer/audience/JWKS settings must agree.
+The dashboard selector switches between the all-plants portfolio and an individual plant. Asset search, condition, and criticality filters apply within the selected scope; KPIs and pending approvals are scoped to the same plant. When both public `VITE_OIDC_AUTHORITY` and `VITE_OIDC_CLIENT_ID` are set, the browser uses OIDC Authorization Code + PKCE and sends access tokens as bearer credentials. With either value unset, local development requires an explicit session-only demo entry. Provider-specific client registration, redirect allowlists, role, group, and plant claims, and API issuer/audience/JWKS settings must agree. Before production rollout, sign in with representative real accounts for each role/group/plant, verify the resulting views, and confirm an out-of-scope plant request is denied by the API. `VITE_AUTH_HELP_URL` can link to the identity provider's help page or IT support; without it, the login screen directs users to their administrator.
 
 ## API reference
 

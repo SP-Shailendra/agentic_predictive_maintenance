@@ -5,6 +5,7 @@ import ApprovalModal from './components/ApprovalModal.jsx'
 import AssetHistoryPanel from './components/AssetHistoryPanel.jsx'
 import ChatDrawer from './components/ChatDrawer.jsx'
 import KnowledgeLibrary from './components/KnowledgeLibrary.jsx'
+import LoginPage from './components/LoginPage.jsx'
 import AssetThresholdEditor from './components/AssetThresholdEditor.jsx'
 import AssetGrid from './components/AssetGrid.jsx'
 import ApprovalsDrawer from './components/ApprovalsDrawer.jsx'
@@ -96,9 +97,34 @@ export default function App() {
   const [scenarios, setScenarios] = useState([])
   const [scenarioError, setScenarioError] = useState('')
   const [authState, setAuthState] = useState({ loading: oidcEnabled, enabled: oidcEnabled, user: null, error: '' })
+  const [localDemoEntered, setLocalDemoEntered] = useState(() => window.sessionStorage.getItem('fieldnote-local-demo') === '1')
   const [hashRoute, setHashRoute] = useState(parseHashRoute)
   const authRoles = getUserRoles(authState.user)
+  const authenticated = authState.enabled ? Boolean(authState.user) : localDemoEntered
   const hasRole = (...roles) => !authState.enabled || roles.some((role) => authRoles.includes(role))
+
+  async function handleSignIn() {
+    setAuthState((current) => ({ ...current, error: '' }))
+    try {
+      await signIn()
+    } catch (authError) {
+      setAuthState((current) => ({ ...current, error: authError.message || 'Sign-in could not be started.' }))
+    }
+  }
+
+  function enterLocalDemo() {
+    window.sessionStorage.setItem('fieldnote-local-demo', '1')
+    setLocalDemoEntered(true)
+  }
+
+  async function handleSignOut() {
+    if (authState.enabled) {
+      await signOut()
+      return
+    }
+    window.sessionStorage.removeItem('fieldnote-local-demo')
+    setLocalDemoEntered(false)
+  }
 
   async function refreshAll() {
     const requestId = ++refreshRequest.current
@@ -177,7 +203,7 @@ export default function App() {
       setActiveWorkflow(null)
       return undefined
     }
-    if (authState.loading || (authState.enabled && !authState.user)) return undefined
+    if (authState.loading || !authenticated) return undefined
     let active = true
     setManagerView('operator')
     async function loadRoute() {
@@ -203,17 +229,17 @@ export default function App() {
     }
     void loadRoute()
     return () => { active = false }
-  }, [hashRoute?.type, hashRoute?.id, authState.loading, authState.user?.profile?.sub])
+  }, [hashRoute?.type, hashRoute?.id, authState.loading, authState.user?.profile?.sub, authenticated])
 
   useEffect(() => {
-    if (authState.loading || (authState.enabled && !authState.user)) return undefined
+    if (authState.loading || !authenticated) return undefined
     refreshAll()
     const timer = window.setInterval(refreshAll, 6000)
     return () => { window.clearInterval(timer); refreshRequest.current += 1 }
-  }, [selectedPlantId, authState.loading, authState.user?.profile?.sub])
+  }, [selectedPlantId, authState.loading, authState.user?.profile?.sub, authenticated])
 
   useEffect(() => {
-    if (managerView !== 'manager' || authState.loading || (authState.enabled && !authState.user)) return undefined
+    if (managerView !== 'manager' || authState.loading || !authenticated) return undefined
     let active = true
     const plantFilter = selectedPlantId === 'all' ? undefined : selectedPlantId
     setManagerMetricsLoading(true)
@@ -229,10 +255,10 @@ export default function App() {
       .catch((requestError) => { if (active) setManagerMetricsError(requestError.message || 'Manager metrics are unavailable for this role.') })
       .finally(() => { if (active) setManagerMetricsLoading(false) })
     return () => { active = false }
-  }, [managerView, selectedPlantId, managerRefreshVersion, authState.loading, authState.user?.profile?.sub])
+  }, [managerView, selectedPlantId, managerRefreshVersion, authState.loading, authState.user?.profile?.sub, authenticated])
 
   useEffect(() => {
-    if (authState.loading || (authState.enabled && !authState.user)) return undefined
+    if (authState.loading || !authenticated) return undefined
     setTelemetryQuality(null)
     if (!selectedAsset) {
       setTelemetry([])
@@ -256,10 +282,10 @@ export default function App() {
       active = false
       window.clearInterval(timer)
     }
-  }, [selectedAsset?.id, readingLimit, authState.loading, authState.user?.profile?.sub])
+  }, [selectedAsset?.id, readingLimit, authState.loading, authState.user?.profile?.sub, authenticated])
 
   useEffect(() => {
-    if (authState.loading || (authState.enabled && !authState.user)) return undefined
+    if (authState.loading || !authenticated) return undefined
     if (!traceWorkflowId) {
       setAuditEvents([])
       return undefined
@@ -269,10 +295,10 @@ export default function App() {
       .then((events) => { if (active) setAuditEvents(events) })
       .catch((requestError) => { if (active) setError(requestError.message || 'Workflow event request failed') })
     return () => { active = false }
-  }, [traceWorkflowId, authState.loading, authState.user?.profile?.sub])
+  }, [traceWorkflowId, authState.loading, authState.user?.profile?.sub, authenticated])
 
   useEffect(() => {
-    if (authState.loading || (authState.enabled && !authState.user) || !activeWorkflow?.asset_id) {
+    if (authState.loading || !authenticated || !activeWorkflow?.asset_id) {
       setReviewTelemetry([])
       return undefined
     }
@@ -281,7 +307,7 @@ export default function App() {
       .then((readings) => { if (active) setReviewTelemetry(readings) })
       .catch(() => { if (active) setReviewTelemetry([]) })
     return () => { active = false }
-  }, [activeWorkflow?.id, authState.loading, authState.user?.profile?.sub])
+  }, [activeWorkflow?.id, authState.loading, authState.user?.profile?.sub, authenticated])
 
   useEffect(() => {
     if (refreshing || !selectedAsset) return
@@ -538,21 +564,11 @@ export default function App() {
   const selectedAssetTitle = selectedAsset ? `${selectedAsset.asset_tag} · ${selectedAsset.name}` : 'Select an asset'
 
   if (authState.loading) {
-    return <main className="auth-gate"><div className="auth-gate-panel"><span className="brand-name">Compunnel FieldNote</span><p>Checking secure sign-in…</p></div></main>
+    return <LoginPage oidcEnabled loading />
   }
 
-  if (authState.enabled && !authState.user) {
-    return (
-      <main className="auth-gate">
-        <section className="auth-gate-panel">
-          <span className="brand-name">Compunnel FieldNote</span>
-          <h1>Sign in to Fieldnote</h1>
-          <p>Use your organization account to review plant telemetry and maintenance workflows.</p>
-          {authState.error && <p className="auth-gate-error" role="alert">{authState.error}</p>}
-          <button className="button button-primary" type="button" onClick={() => signIn().catch((authError) => setAuthState((current) => ({ ...current, error: authError.message })))}>Sign in</button>
-        </section>
-      </main>
-    )
+  if (!authenticated) {
+    return <LoginPage oidcEnabled={authState.enabled} error={authState.error} onSignIn={handleSignIn} onDemoAccess={enterLocalDemo} />
   }
 
   return (
@@ -568,10 +584,10 @@ export default function App() {
         overdueCount={overdueCount}
         connected={apiStatus === 'connected'}
         connectionStatus={apiStatus}
-        authEnabled={authState.enabled}
-        userName={getUserDisplayName(authState.user)}
+        authEnabled={authState.enabled || localDemoEntered}
+        userName={authState.enabled ? getUserDisplayName(authState.user) : localDemoEntered ? 'Local demo identity' : ''}
         userRoles={authRoles}
-        onSignOut={signOut}
+        onSignOut={handleSignOut}
         onOpenChat={() => setChatOpen(true)}
         onOpenApprovals={() => setApprovalsOpen(true)}
         demoData={Boolean(healthStatus?.simulator_enabled)}

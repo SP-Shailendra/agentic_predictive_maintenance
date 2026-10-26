@@ -48,6 +48,7 @@ services:
         VITE_OIDC_CLIENT_ID: ${VITE_OIDC_CLIENT_ID:-}
         VITE_OIDC_REDIRECT_URI: ${VITE_OIDC_REDIRECT_URI:-http://localhost:4173/}
         VITE_OIDC_ROLES_CLAIM: ${VITE_OIDC_ROLES_CLAIM:-roles}
+        VITE_AUTH_HELP_URL: ${VITE_AUTH_HELP_URL:-}
     ports:
       - "127.0.0.1:4173:4173"
     depends_on:
