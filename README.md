@@ -183,7 +183,6 @@ agentic_predictive_maintenance/       # Clone directory; an existing local check
 ├── .gitattributes                  # Keep PDF/DOCX fixtures binary
 ├── .gitignore                      # Exclude credentials, local data, and generated files
 ├── README.md
-├── RAG_Implementation_Roadmap_Predictive_Maintenance.md
 ├── docker-compose.yml
 ├── backend/
 │   ├── Dockerfile
